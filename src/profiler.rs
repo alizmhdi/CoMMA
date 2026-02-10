@@ -385,7 +385,9 @@ pub fn init_handler(
             env_logger::init();
             // after this point we should be able to use all the log macros
 
-            PROFILER.set(Profiler::new(version)).unwrap();
+            // get_or_init: creates Profiler only on first init, reuses on subsequent cycles
+            PROFILER.get_or_init(|| Profiler::new(version));
+            // Always spawn daemon when INIT_FLAG=0 (daemon was stopped on last finalize)
             PROFILER.get().unwrap().spawn_daemon();
         }
         *lg += 1;
@@ -412,7 +414,9 @@ pub fn init_handler_v4(
     if config::CONFIG.telemetry_mode > 0 {
         let mut lg = INIT_FLAG.lock().unwrap();
         if *lg == 0 {
-            PROFILER.set(Profiler::new(version)).unwrap();
+            // get_or_init: creates Profiler only on first init, reuses on subsequent cycles
+            PROFILER.get_or_init(|| Profiler::new(version));
+            // Always spawn daemon when INIT_FLAG=0 (daemon was stopped on last finalize)
             PROFILER.get().unwrap().spawn_daemon();
         }
         *lg += 1;
