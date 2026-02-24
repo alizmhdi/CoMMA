@@ -77,6 +77,7 @@ impl Profiler {
         Self {
             config: config.clone(),
             version,
+            // SAFETY: `getpid()` takes no input and does not modify rust-managed state
             pid: unsafe { libc::getpid() },
             init_time,
             init_instant,
@@ -160,7 +161,7 @@ impl Profiler {
     }
 }
 
-pub fn thread_local_state(profiler: &Profiler) -> (ThreadLocalState, daemon::ThreadControl) {
+pub fn thread_local_state(profiler: &'_ Profiler) -> (ThreadLocalState<'_>, daemon::ThreadControl) {
     let (mut ncclop_tx, ncclop_rx) = spsc::channel(EVENT_QUEUE_SZ);
     let (mut fifo_tx, fifo_rx) = spsc::channel(EVENT_QUEUE_SZ);
     ncclop_tx.set_batch(std::cmp::max(1, profiler.config.fifo_batch_size));
@@ -181,6 +182,7 @@ pub fn thread_local_state(profiler: &Profiler) -> (ThreadLocalState, daemon::Thr
         proxyop_free_list: slab::FreeList::new_list(slab::FREELIST_BATCH * 4),
         proxystep_free_list: slab::FreeList::new_list(n_free_proxystep),
         steps_free_list: slab::FreeList::new_list(slab::FREELIST_BATCH * 4),
+        kernelch_free_list: slab::FreeList::new_list(slab::FREELIST_BATCH),
         proxyop_id: 0,
         rng: SmallRng::from_rng(&mut rand::rng()),
     };
@@ -215,11 +217,12 @@ pub struct ThreadLocalState<'a> {
     pub fifo: spsc::Sender<daemon::Message>,
     pub profiler: &'a Profiler,
 
-    pub ncclop_refcnt: HashMap<(libc::pid_t, usize), (usize, Instant)>,
+    pub ncclop_refcnt: HashMap<(libc::pid_t, usize), (usize, Instant, bool)>,
     pub ncclop_free_list: slab::FreeList<event::NcclOp>,
     pub proxyop_free_list: slab::FreeList<ProxyOpLocalData>,
     pub proxystep_free_list: slab::FreeList<event::ProxyStep>,
     pub steps_free_list: slab::FreeList<daemon::StepBatch>,
+    pub kernelch_free_list: slab::FreeList<KernelCh>,
 
     proxyop_id: u32,
     rng: SmallRng,
@@ -248,7 +251,7 @@ impl ThreadLocalState<'_> {
         let cnt = self
             .ncclop_refcnt
             .entry((pid, op))
-            .or_insert_with(|| (0, self.profiler.recent_timer_instant()));
+            .or_insert_with(|| (0, self.profiler.recent_timer_instant(), false));
         cnt.0 += 1;
         cnt.0 - 1
     }
@@ -264,6 +267,15 @@ impl ThreadLocalState<'_> {
             }
         } else {
             None
+        }
+    }
+
+    pub fn update_ncclop_start_time(&mut self, pid: libc::pid_t, op: usize) {
+        if let Some(e) = self.ncclop_refcnt.get_mut(&(pid, op)) {
+            if !e.2 {
+                e.1 = self.profiler.recent_timer_instant();
+                e.2 = true;
+            }
         }
     }
 
@@ -319,6 +331,13 @@ impl Communicator {
 }
 
 #[derive(Debug)]
+#[repr(align(16))]
+pub struct KernelCh {
+    pub parent_op: Option<usize>,
+}
+
+#[derive(Debug)]
+#[repr(align(16))]
 pub struct ProxyOpLocalData {
     pub info: event::ProxyOpInfo,
     pub extra: event::ProxyOpExtra,
@@ -356,6 +375,7 @@ impl ProxyOpLocalData {
                 thread_state
                     .steps_free_list
                     .alloc(
+                        // SAFETY: alloc() function always call the closure with valid pointer
                         |p| unsafe { daemon::StepBatch::init(p) },
                         Some(&thread_state.profiler.free_step_batch),
                         true,
@@ -396,6 +416,9 @@ pub fn init_handler(
         mask |= profiler_shim::ncclProfileColl;
         mask |= profiler_shim::ncclProfileP2p;
         mask |= profiler_shim::ncclProfileProxyOp;
+        if config::CONFIG.track_kernel_ch {
+            mask |= profiler_shim::ncclProfileKernelCh;
+        }
     }
     *e_activation_mask = mask as i32;
     Ok(Box::new(Communicator::new()))
@@ -425,6 +448,10 @@ pub fn init_handler_v4(
         mask |= profiler_shim::ncclProfileColl;
         mask |= profiler_shim::ncclProfileP2p;
         mask |= profiler_shim::ncclProfileProxyOp;
+
+        if config::CONFIG.track_kernel_ch {
+            mask |= profiler_shim::ncclProfileKernelCh;
+        }
 
         if config::CONFIG.track_steps | config::CONFIG.aggregate_steps {
             mask |= profiler_shim::ncclProfileProxyStep;
@@ -530,44 +557,45 @@ where
             let descr = unsafe { descr.cast_to_p2p() };
             // SAFETY: for coll and p2p, NCCL guarantees the comm pointer is valid
             let comm = unsafe { &*comm };
-            let should_skip = with_thread_state(|thread_state| {
-                !thread_state.rnd_decision(thread_state.profiler.config.p2p_sample_rate)
+            let should_sample = with_thread_state(|thread_state| {
+                if thread_state.rnd_decision(thread_state.profiler.config.p2p_sample_rate) {
+                    if descr.is_send() {
+                        true
+                    } else {
+                        thread_state.rnd_decision(thread_state.profiler.config.p2p_recv_sample_rate)
+                    }
+                } else {
+                    false
+                }
             });
 
-            let sample_recv = || {
-                with_thread_state(|thread_state| {
-                    thread_state.rnd_decision(thread_state.profiler.config.p2p_recv_sample_rate)
-                })
-            };
-
-            if should_skip {
-                None
-            } else if config.track_ncclop && (descr.is_send() || sample_recv()) {
-                let byte_count = descr.byte_count();
-                if byte_count > config.small_msg_threshold {
-                    with_thread_state(|thread_state| {
-                        Some(
-                            thread_state
-                                .new_ncclop(
-                                    descr,
-                                    thread_state.profiler.recent_timer_instant(), //Instant::now()
-                                    /* is_lite = */ false,
-                                    comm.comm_hash,
-                                )
-                                .unwrap_or_else(|| event::Event::new_dummyop(42)),
-                        )
-                    })
-                } else {
+            if should_sample {
+                if config.track_ncclop {
+                    let byte_count = descr.byte_count();
+                    if byte_count > config.small_msg_threshold {
+                        with_thread_state(|thread_state| {
+                            Some(
+                                thread_state
+                                    .new_ncclop(
+                                        descr,
+                                        thread_state.profiler.recent_timer_instant(), //Instant::now()
+                                        /* is_lite = */ false,
+                                        comm.comm_hash,
+                                    )
+                                    .unwrap_or_else(|| event::Event::new_dummyop(42)),
+                            )
+                        })
+                    } else {
+                        None
+                    }
+                } else if config.track_proxyop {
                     let comm_hash = comm
                         .comm_hash
                         .unwrap_or_else(|| descr.comm_hash().unwrap_or(42));
-                    Some(event::Event::SmallNcclOp(comm_hash as usize))
+                    Some(event::Event::new_dummyop(comm_hash as usize))
+                } else {
+                    None
                 }
-            } else if config.track_proxyop {
-                let comm_hash = comm
-                    .comm_hash
-                    .unwrap_or_else(|| descr.comm_hash().unwrap_or(42));
-                Some(event::Event::new_dummyop(comm_hash as usize))
             } else {
                 None
             }
@@ -623,6 +651,33 @@ where
                 })
             }
         }
+        profiler_shim::ncclProfileKernelCh => {
+            let parent_ffi = descr.parent_obj();
+            let parent_type = event_ffi::get_handle_type(parent_ffi);
+            if parent_ffi.is_null() || parent_type == event_ffi::Type::SmallNcclOp {
+                None
+            } else {
+                let parent = event_ffi::ProxyParent::from_ffi(parent_ffi);
+                if let event_ffi::ProxyParent::NcclOp(ncclop) = parent {
+                    with_thread_state(|thread_state| {
+                        thread_state.inc_ncclop_ref(thread_state.profiler.pid, ncclop);
+                        let kernelch = thread_state
+                            .kernelch_free_list
+                            .alloc_new(
+                                KernelCh {
+                                    parent_op: Some(ncclop),
+                                },
+                                None,
+                                true,
+                            )
+                            .unwrap();
+                        Some(event::Event::KernelCh(kernelch))
+                    })
+                } else {
+                    None
+                }
+            }
+        }
         profiler_shim::ncclProfileProxyStep => {
             // SAFETY: just checked that event type is proxystep
             let descr = unsafe { descr.cast_to_proxystep() };
@@ -630,6 +685,9 @@ where
             if parent_ffi.is_null() {
                 None
             } else {
+                // SAFETY: When not set to null,
+                // NCCL always sets the parent_obj to a valid handle returned by profiler
+                // API. So `event::Event::from_ffi()` would always be called on a valid handle
                 let parent = unsafe { event::Event::from_ffi(parent_ffi) };
                 if let Some(event::Event::ProxyOp(op)) = parent {
                     with_thread_state(|thread_state| {
@@ -717,6 +775,22 @@ pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
             }
             thread_state.proxystep_free_list.free(data);
         }
+        event::Event::KernelCh(kernelch) => {
+            thread_state.fifo.prefetch_next();
+            if let Some(ncclop) = kernelch.parent_op {
+                if let Some(start_time) =
+                    thread_state.dec_ncclop_ref(thread_state.profiler.pid, ncclop)
+                {
+                    let msg = daemon::Message::KernelCh(
+                        start_time,
+                        start_time.elapsed().as_nanos() as u64,
+                        ncclop,
+                    );
+                    thread_state.send_to_daemon(msg, true);
+                }
+            }
+            thread_state.kernelch_free_list.free(kernelch);
+        }
         event::Event::Dummy(_) => (),
         event::Event::SmallNcclOp(_) => (),
         event::Event::NcclOpLite(_) => {}
@@ -792,10 +866,32 @@ where
     Ok(())
 }
 
+pub fn record_proxyop_event_state_handler_v4(
+    event: &mut event::Event,
+    e_state: profiler_shim::ncclProfilerEventState_v1_t,
+) -> NcclResult<()> {
+    if let event::Event::ProxyOpLite(data) = event {
+        if e_state != profiler_shim::proxy_event_state::v4::PROXYOP_IN_PROGRESS {
+            return Ok(());
+        }
+        with_thread_state(|thread_state| {
+            if let Some(ncclop) = data.parent_op {
+                thread_state.update_ncclop_start_time(data.info.pid, ncclop);
+            }
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::boxed_local)]
-pub fn finalize_handler(_comm: Box<Communicator>) -> NcclResult<()> {
+pub fn finalize_handler(comm: Box<Communicator>) -> NcclResult<()> {
     if config::CONFIG.telemetry_mode > 0 {
         let mut lg = INIT_FLAG.lock().unwrap();
+        if let Some(comm_hash) = comm.comm_hash {
+            with_thread_state(|thread_state| {
+                thread_state.send_to_daemon(daemon::Message::CommClose(comm_hash), true);
+            });
+        }
         if *lg == 1 {
             let profiler = PROFILER.get().unwrap();
             profiler.join_daemon();

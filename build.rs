@@ -15,11 +15,19 @@
 use std::env;
 use std::path::PathBuf;
 
-fn write_binding(hdr_path: &str, output_path: &std::path::Path) {
-    let bindings = bindgen::Builder::default()
+fn write_binding(
+    hdr_path: &str,
+    output_path: &std::path::Path,
+    extra_include_path: Option<&std::path::Path>,
+) {
+    let mut builder = bindgen::Builder::default()
         .header(hdr_path)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
-        .impl_debug(true)
+        .impl_debug(true);
+    if let Some(p) = extra_include_path {
+        builder = builder.clang_arg(format!("-I{}", p.display()));
+    }
+    let bindings = builder
         .generate()
         .unwrap_or_else(|e| panic!("Unable to generate bindings for {}: {}", hdr_path, e));
     bindings
@@ -54,8 +62,9 @@ fn main() {
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     write_binding(
-        &format!("{}/profiler.h", profiler_hdr_dir),
+        "third_party/nccl-profiler-hdr-wrapper.h",
         &out_path.join("profiler_shim_inner.rs"),
+        Some(std::path::Path::new(profiler_hdr_dir)),
     );
 
     println!("cargo:rerun-if-changed={}", profiler_hdr_dir);
@@ -86,4 +95,15 @@ fn main() {
         .write_to_file(&gpuviz_shim)
         .unwrap_or_else(|e| panic!("Could not write bindings to {:?}: {}!", gpuviz_shim, e));
     println!("cargo:rerun-if-changed=GPUViz");
+
+    let mut tonic_config = tonic_build::Config::default();
+    tonic_config.disable_comments([".google.api.MethodSettings", ".google.api.JavaSettings"]);
+    tonic_build::configure()
+        .build_server(false)
+        .compile_protos_with_config(
+            tonic_config,
+            &["GPUViz/src/proto/nccl_telemetry_proto.proto"],
+            &["GPUViz/src"],
+        )
+        .unwrap();
 }

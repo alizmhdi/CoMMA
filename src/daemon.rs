@@ -130,6 +130,12 @@ pub enum Message {
         slab::AllocatedNode<StepBatch>,
         /* is_last =*/ bool,
     ),
+    KernelCh(
+        /* start time */ Instant,
+        /* duration ns */ u64,
+        /* parent handle */ usize,
+    ),
+    CommClose(/* comm_hash = */ u64),
 }
 
 #[derive(Debug)]
@@ -155,8 +161,10 @@ pub type StepBatch = fixed_batch::Batch<EventStep, STEP_BATCH_SZ>;
 ///   2. resource used by the telemetry exporter, which may be blocking for I/O
 pub enum Telemetry {
     Group(Box<event::Group>),
+    NcclOpIssued(Box<event::NcclOp>), // copybara:strip(hang detection)
     NcclOp(Box<event::NcclOp>),
     ProxyOp(Box<event::ProxyOp>),
+    CommClose(/* comm_hash = */ u64),
 }
 
 pub struct PollingContext<'a> {
@@ -407,7 +415,11 @@ impl<'a> PollingContext<'a> {
             Message::NcclOp(op) => {
                 let id = op.id();
                 let op = self.free_ncclop.take_and_free(op);
-                let _ = self.ncclops.insert(id, Box::new(op));
+                let _ = self.ncclops.insert(id, Box::new(op.clone()));
+                // copybara:strip_begin(hang detection)
+                self.pending_telemetry
+                    .push_back(Telemetry::NcclOpIssued(Box::new(op)));
+                // copybara:strip_end
                 if self.free_ncclop.num_free() >= slab::FREELIST_BATCH {
                     self.free_ncclop.try_publish(&self.profiler.free_ncclop);
                 }
@@ -456,7 +468,7 @@ impl<'a> PollingContext<'a> {
                 let init_instant = self.profiler.init_instant;
                 for step in steps.drain() {
                     let start_time = init_instant + Duration::from_nanos(step.start_time as _);
-                    let end_time = start_time + Duration::from_nanos(step.dur_ns as _);
+                    let end_time = init_instant + Duration::from_nanos(step.end_time_ns() as _);
                     proxyop.try_set_start_time(start_time);
                     proxyop.set_end_time(end_time);
                     proxyop.add_step(step);
@@ -486,6 +498,19 @@ impl<'a> PollingContext<'a> {
                     self.free_step_batch
                         .try_publish(&self.profiler.free_step_batch);
                 }
+            }
+            Message::KernelCh(start_time, duration, parent) => {
+                if let Some(ncclop) = self.get_ncclop(parent) {
+                    ncclop_update(
+                        ncclop,
+                        start_time,
+                        Some(start_time + Duration::from_nanos(duration)),
+                    );
+                }
+            }
+            Message::CommClose(comm_hash) => {
+                self.pending_telemetry
+                    .push_back(Telemetry::CommClose(comm_hash));
             }
         }
     }
@@ -519,6 +544,30 @@ impl<'a> PollingContext<'a> {
               InterProcessMessage::ReplyProxyOpComm(_, _, _) => {}
               */
         }
+    }
+
+    fn try_reclaim_ncclops_from_map<P>(&mut self, mut should_reclaim: P)
+    where
+        P: FnMut(&Box<event::NcclOp>) -> ReclaimAction,
+    {
+        let mut to_keep = Vec::new();
+        while let Some((k, v)) = self.ncclops.pop_first() {
+            match should_reclaim(&v) {
+                ReclaimAction::Keep => to_keep.push((k, v)),
+                ReclaimAction::Reclaim => self.reclaim_ncclop(*v),
+                ReclaimAction::Stop => {
+                    self.ncclops.insert(k, v);
+                    break;
+                }
+            }
+        }
+        for (k, v) in to_keep {
+            self.ncclops.insert(k, v);
+        }
+    }
+
+    pub fn reclaim_all_ncclops_in_map(&mut self) {
+        self.try_reclaim_ncclops_from_map(|_| ReclaimAction::Reclaim);
     }
 }
 
@@ -576,31 +625,6 @@ enum ReclaimAction {
     Keep,
     Reclaim,
     Stop,
-}
-
-fn try_reclaim_ncclop<K, V, P, A>(
-    ncclops: &mut BTreeMap<K, V>,
-    mut should_reclaim: P,
-    mut reclaim_action: A,
-) where
-    K: Ord,
-    P: FnMut(&V) -> ReclaimAction,
-    A: FnMut(V),
-{
-    let mut to_keep = Vec::new();
-    while let Some((k, v)) = ncclops.pop_first() {
-        match should_reclaim(&v) {
-            ReclaimAction::Keep => to_keep.push((k, v)),
-            ReclaimAction::Reclaim => reclaim_action(v),
-            ReclaimAction::Stop => {
-                ncclops.insert(k, v);
-                break;
-            }
-        }
-    }
-    for (k, v) in to_keep {
-        ncclops.insert(k, v);
-    }
 }
 
 fn ipc_shm_path(pid: libc::pid_t) -> String {
@@ -711,40 +735,30 @@ where
         }
 
         let mut n_processed = 0;
-        let mut ncclops = std::mem::take(&mut ctx.ncclops);
-        try_reclaim_ncclop(
-            &mut ncclops,
-            |op| {
-                if n_processed > NCCLOP_RECLAIM_BATCH {
-                    return ReclaimAction::Stop;
-                }
-                n_processed += 1;
-                if should_reclaim_ncclop(op, ncclop_comp_delay, ncclop_timeout) {
+        ctx.try_reclaim_ncclops_from_map(|op| {
+            if n_processed > NCCLOP_RECLAIM_BATCH {
+                return ReclaimAction::Stop;
+            }
+            n_processed += 1;
+            if should_reclaim_ncclop(op, ncclop_comp_delay, ncclop_timeout) {
+                ReclaimAction::Reclaim
+            } else {
+                ReclaimAction::Keep
+            }
+        });
+
+        if ctx.ncclops.len() > ctx.profiler.config.max_tracked_ncclop {
+            // force reclaim
+            let mut num_to_reclaim = ctx.ncclops.len() - ctx.profiler.config.max_tracked_ncclop;
+            ctx.try_reclaim_ncclops_from_map(|_| {
+                if num_to_reclaim > 0 {
+                    num_to_reclaim -= 1;
                     ReclaimAction::Reclaim
                 } else {
-                    ReclaimAction::Keep
+                    ReclaimAction::Stop
                 }
-            },
-            |op| ctx.reclaim_ncclop(*op),
-        );
-
-        if ncclops.len() > ctx.profiler.config.max_tracked_ncclop {
-            // force reclaim
-            let mut num_to_reclaim = ncclops.len() - ctx.profiler.config.max_tracked_ncclop;
-            try_reclaim_ncclop(
-                &mut ncclops,
-                |_| {
-                    if num_to_reclaim > 0 {
-                        num_to_reclaim -= 1;
-                        ReclaimAction::Reclaim
-                    } else {
-                        ReclaimAction::Stop
-                    }
-                },
-                |op| ctx.reclaim_ncclop(*op),
-            );
+            });
         }
-        ctx.ncclops = ncclops;
 
         exporter.export(ctx, None)
     }
@@ -765,12 +779,7 @@ where
         });
     }
 
-    let mut ncclops = std::mem::take(&mut ctx.ncclops);
-    try_reclaim_ncclop(
-        &mut ncclops,
-        |_| ReclaimAction::Reclaim,
-        |op| ctx.reclaim_ncclop(*op),
-    );
+    ctx.reclaim_all_ncclops_in_map();
 
     exporter.export(ctx, Some(RETRY_MS));
 }

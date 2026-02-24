@@ -41,6 +41,9 @@ struct Args {
 fn dummy_coll_descr() -> profiler_shim::ncclProfilerEventDescr_v2_t {
     let mut descr = MaybeUninit::uninit();
     let ptr: *mut profiler_shim::ncclProfilerEventDescr_v2_t = descr.as_mut_ptr();
+
+    // SAFETY: ptr points to a valid memory
+    // The descriptor is a plain C struct so this initialization is safe.
     unsafe {
         (*ptr).type_ = profiler_shim::ncclProfileColl as _;
         (*ptr).parentObj = std::ptr::null_mut();
@@ -63,6 +66,8 @@ fn dummy_proxyop_descr(
 ) -> profiler_shim::ncclProfilerEventDescr_v2_t {
     let mut descr = MaybeUninit::uninit();
     let ptr: *mut profiler_shim::ncclProfilerEventDescr_v2_t = descr.as_mut_ptr();
+    // SAFETY: ptr points to a valid memory
+    // The descriptor is a plain C struct so this initialization is safe.
     unsafe {
         (*ptr).type_ = profiler_shim::ncclProfileProxyOp as _;
         (*ptr).parentObj = parent;
@@ -82,6 +87,8 @@ fn main() {
     let args = Args::parse();
     let profiler_symbols = nccl_profiler::ncclProfiler_v2;
 
+    // SAFETY: calling the C API exposed by CoMMA
+    // init is safe to call as long as both input pointers are valid
     let comm = unsafe {
         let mut comm = std::ptr::null_mut();
         let mut mask = 0;
@@ -92,6 +99,8 @@ fn main() {
     let mut colls = Vec::with_capacity(args.num_coll);
     for _ in 0..args.num_coll {
         let descr = dummy_coll_descr();
+        // SAFETY: calling the C API exposed by CoMMA
+        // descr is a valid descriptor
         let c = unsafe {
             let mut handle = std::ptr::null_mut();
             assert_eq!(
@@ -108,6 +117,8 @@ fn main() {
     }
 
     for c in colls.iter() {
+        // SAFETY: calling the C API exposed by CoMMA
+        // handle is valid
         unsafe {
             assert_eq!(
                 profiler_symbols.stopEvent.unwrap()(*c),
@@ -116,12 +127,15 @@ fn main() {
         }
     }
 
+    // SAFETY: getpid() is a safe C API
     let my_pid = unsafe { libc::getpid() };
 
     let mut proxyops = Vec::with_capacity(args.num_parallel_proxyop);
 
     for c in colls.iter() {
         for p_i in 0..args.proxyop_per_coll {
+            // SAFETY: calling the C API exposed by CoMMA
+            // descr is a valid descriptor
             let handle = unsafe {
                 let descr = dummy_proxyop_descr(*c, my_pid);
                 let mut handle = std::ptr::null_mut();
@@ -140,9 +154,11 @@ fn main() {
                 || p_i + args.num_parallel_proxyop > args.proxyop_per_coll
             {
                 let n_round = args.steps_per_proxyop / args.num_parallel_step;
+                // SAFETY: zero initiated EventStateArg is valid
                 let mut step_args: EventStateArg = unsafe { std::mem::zeroed() };
                 for h in proxyops.iter() {
                     for _ in 0..args.num_parallel_step {
+                        // SAFETY: calling the C API exposed by CoMMA
                         unsafe {
                             assert_eq!(
                                 profiler_symbols.recordEventState.unwrap()(
@@ -156,11 +172,14 @@ fn main() {
                     }
                 }
                 for _ in 0..n_round {
+                    // SAFETY: accessing union variant
                     unsafe {
                         step_args.proxyOp.transSize += args.step_size;
                     }
                     for h in proxyops.iter() {
                         for _ in 0..args.num_parallel_step {
+                            // SAFETY: calling the C API exposed by CoMMA
+                            // following the same convension as NCCL
                             unsafe {
                                 assert_eq!(
                                     profiler_symbols.recordEventState.unwrap()(
@@ -175,6 +194,8 @@ fn main() {
                     }
                     for h in proxyops.iter() {
                         for _ in 0..args.num_parallel_step {
+                            // SAFETY: calling the C API exposed by CoMMA
+                            // following the same convension as NCCL
                             unsafe {
                                 assert_eq!(
                                     profiler_symbols.recordEventState.unwrap()(
@@ -187,12 +208,16 @@ fn main() {
                             }
                         }
                     }
+                    // SAFETY: access proxyop variant of the union.
+                    // for proxy step, this is what NCCL would update
                     unsafe {
                         step_args.proxyOp.steps += 1;
                     }
                 }
 
                 for h in proxyops.iter() {
+                    // SAFETY: calling the C API exposed by CoMMA
+                    // following the same convension as NCCL
                     unsafe {
                         assert_eq!(
                             profiler_symbols.stopEvent.unwrap()(*h),

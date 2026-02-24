@@ -20,9 +20,14 @@ path = "src/integration_benchmark.rs"
 name = "clock"
 harness = false
 
+[features]
+default = []
+explicit-optin = []
+
 [build-dependencies]
 bindgen = "0.66.0"
 cmake = "0.1"
+tonic-build = "0.12.3"
 
 [dev-dependencies]
 criterion = { version = "0.4", features = ["html_reports"] }
@@ -36,8 +41,11 @@ libc = "0.2.169"
 libloading = "0.8.6"
 log = "0.4.20"
 nom = "8.0.0"
+prost = "0.13.3"
+prost-types = "0.13.3"
 rand = "0.9.0"
 serde_json = "1.0"
 static_assertions = "1.1.0"
 tempfile = "3.19.0"
 tokio = { version = "1.43.0", features = ["full"] }
+tonic = { version = "0.12.3", features = ["tls", "tls-native-roots", "tls-webpki-roots"] }

@@ -310,6 +310,7 @@ mod tests {
         let shm = Shm::create("test-2", N * std::mem::size_of::<u32>()).unwrap();
         let ptr = shm.mem() as *mut u32;
         for i in 0..N {
+            // SAFETY: ptr is pointing to valid memory of size N * sizeof(u32)
             unsafe {
                 ptr.add(i).write(i as u32);
             }
@@ -322,6 +323,7 @@ mod tests {
 
         let ptr = shm_opened.mem() as *mut u32;
         for i in 0..N {
+            // SAFETY: ptr is pointing to valid memory of size N * sizeof(u32)
             unsafe {
                 assert_eq!(ptr.add(i).read(), i as u32);
             }

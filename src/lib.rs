@@ -19,6 +19,7 @@ mod daemon;
 mod event;
 mod event_ffi;
 mod fixed_batch;
+mod gcp_acs_proto; // copybara:strip(oss_protobuf)
 mod gpuviz;
 mod histogram;
 mod nccl_metadata;
@@ -337,16 +338,30 @@ unsafe extern "C" fn profiler_record_event_state_v4(
     e_state_args: *mut profiler_shim::ncclProfilerEventStateArgs_v4_t,
 ) -> ncclResult_t {
     let handle_type = event_ffi::get_handle_type(e_handle);
-    if std::matches!(handle_type, event_ffi::Type::ProxyStep) {
-        if let Some(mut event) = event::Event::from_ffi(e_handle) {
-            let step_state = nccl_metadata::ProxyStepStateV4::cast_from_union(&*e_state_args);
-            if let Err(e) =
-                profiler::record_proxystep_event_state_handler(&mut event, e_state, step_state)
-            {
-                return e;
+    match handle_type {
+        event_ffi::Type::ProxyStep => {
+            if let Some(mut event) = event::Event::from_ffi(e_handle) {
+                let step_state = nccl_metadata::ProxyStepStateV4::cast_from_union(&*e_state_args);
+                if let Err(e) =
+                    profiler::record_proxystep_event_state_handler(&mut event, e_state, step_state)
+                {
+                    return e;
+                }
+                let _ = event::Event::into_ffi(event);
             }
-            let _ = event::Event::into_ffi(event);
         }
+
+        event_ffi::Type::ProxyOpLite => {
+            if let Some(mut event) = event::Event::from_ffi(e_handle) {
+                if let Err(e) = profiler::record_proxyop_event_state_handler_v4(&mut event, e_state)
+                {
+                    return e;
+                }
+                let _ = event::Event::into_ffi(event);
+            }
+        }
+
+        _ => (),
     }
     profiler_shim::ncclResult_t_ncclSuccess
 }

@@ -200,12 +200,18 @@ trait IntoNcclOpType {
 }
 
 impl IntoNcclOpType for u8 {
+    /// # Safety
+    ///
+    /// the number must be a valid "nccl func" field from NCCL core
     unsafe fn into_ncclop_type(self) -> NcclOpType {
         NcclOpType::from_nccl_func(self)
     }
 }
 
 impl IntoNcclOpType for *const libc::c_char {
+    /// # Safety
+    ///
+    /// the number must be a valid "nccl func" pointer from NCCL core
     unsafe fn into_ncclop_type(self) -> NcclOpType {
         NcclOpType::from_c_str_ptr(self)
     }
@@ -301,6 +307,9 @@ pub mod algo {
     }
 
     pub trait IntoAlgo {
+        /// # Safety
+        ///
+        /// must be valid algo from NCCL core
         unsafe fn into_algo(self) -> u8;
     }
 
@@ -366,6 +375,9 @@ pub mod proto {
     }
 
     pub trait IntoProto {
+        /// # Safety
+        ///
+        /// must be a valid proto passed from NCCL core
         unsafe fn into_proto(self) -> u8;
     }
 
@@ -440,6 +452,13 @@ impl NcclOpKey {
             Self::P2pRecv(comm, _, _) => *comm,
             Self::NetSend(comm, _, _) => *comm,
             Self::NetRecv(comm, _, _) => *comm,
+        }
+    }
+
+    pub fn get_coll_op_type(&self) -> NcclOpType {
+        match self {
+            Self::Collective(_, _, op_type, _, _) => *op_type,
+            _ => NcclOpType::Unknown,
         }
     }
 
@@ -635,6 +654,7 @@ pub trait Version: Event {
     #[inline(always)]
     fn try_cast_to_p2p(&self) -> Option<&Self::P2p> {
         if self.type_() as u32 == profiler_shim::ncclProfileP2p {
+            // SAFETY: just checked that event type is collective
             Some(unsafe { self.cast_to_p2p() })
         } else {
             None
@@ -1147,6 +1167,9 @@ impl Version for profiler_shim::EventDescrV4 {
 pub struct ProxyOpStateV1(profiler_shim::ncclProfilerEventStateArgs_v1_t);
 
 impl ProxyOpStateV1 {
+    /// # Safety
+    ///
+    /// input must be known to be a proxyop variant.
     pub unsafe fn cast_from_union(u: &profiler_shim::ncclProfilerEventStateArgs_v1_t) -> &Self {
         let ptr = u as *const profiler_shim::ncclProfilerEventStateArgs_v1_t;
         &*ptr.cast()
@@ -1154,6 +1177,7 @@ impl ProxyOpStateV1 {
 
     #[cfg(test)]
     pub fn new(steps: i32, trans_size: usize) -> Self {
+        // SAFETY: The type itself indicates that this is the proxyOp variant of union
         unsafe {
             let mut inner: profiler_shim::ncclProfilerEventStateArgs_v1_t = std::mem::zeroed();
             inner.proxyOp.steps = steps;
@@ -1169,6 +1193,9 @@ impl_proxyop_state!(ProxyOpStateV1, profiler::Version::V1);
 pub struct ProxyOpStateV2(profiler_shim::ncclProfilerEventStateArgs_v2_t);
 
 impl ProxyOpStateV2 {
+    /// # Safety
+    ///
+    /// input must be known to be a proxyop variant.
     pub unsafe fn cast_from_union(u: &profiler_shim::ncclProfilerEventStateArgs_v2_t) -> &Self {
         let ptr = u as *const profiler_shim::ncclProfilerEventStateArgs_v2_t;
         &*ptr.cast()
@@ -1181,6 +1208,9 @@ impl_proxyop_state!(ProxyOpStateV2, profiler::Version::V2);
 pub struct ProxyOpStateV3(profiler_shim::ncclProfilerEventStateArgs_v3_t);
 
 impl ProxyOpStateV3 {
+    /// # Safety
+    ///
+    /// input must be known to be a proxyop variant.
     pub unsafe fn cast_from_union(u: &profiler_shim::ncclProfilerEventStateArgs_v3_t) -> &Self {
         let ptr = u as *const profiler_shim::ncclProfilerEventStateArgs_v3_t;
         &*ptr.cast()
@@ -1195,6 +1225,9 @@ impl_proxyop_state!(ProxyOpStateV3, profiler::Version::V3);
 pub struct ProxyStepStateV4(profiler_shim::ncclProfilerEventStateArgs_v4_t);
 
 impl ProxyStepStateV4 {
+    /// # Safety
+    ///
+    /// input must be known to be a proxyop variant.
     pub unsafe fn cast_from_union(u: &profiler_shim::ncclProfilerEventStateArgs_v4_t) -> &Self {
         let ptr = u as *const profiler_shim::ncclProfilerEventStateArgs_v4_t;
         &*ptr.cast()

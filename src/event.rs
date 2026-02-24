@@ -32,6 +32,7 @@ pub enum Event {
     NcclOpLite(usize),
     NcclOp(usize),
     ProxyOpLite(slab::AllocatedNode<profiler::ProxyOpLocalData>), // Lite == no step tracking
+    KernelCh(slab::AllocatedNode<profiler::KernelCh>),
     ProxyOp(slab::AllocatedNode<profiler::ProxyOpLocalData>),
     Dummy(usize),
     SmallNcclOp(usize),
@@ -104,6 +105,7 @@ pub trait ProfilerEvent {
 }
 
 #[derive(Debug)]
+#[repr(align(16))]
 pub struct Group {
     basic_info: BasicInfo,
 }
@@ -120,7 +122,7 @@ impl Group {
 }
 
 // NcclOp: collective and P2p
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NcclOp {
     basic_info: BasicInfo,
     id: usize,
@@ -173,7 +175,7 @@ impl ProxyOpInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProxyOp {
     basic_info: BasicInfo,
     info: ProxyOpInfo,
@@ -269,6 +271,14 @@ impl NcclOp {
 
     pub fn _get_descr(&self) -> &nccl_metadata::EventMetadata {
         &self.descr
+    }
+
+    pub fn is_p2p(&self) -> bool {
+        self.is_p2p
+    }
+
+    pub fn get_coll_descr(&self) -> Option<&dyn nccl_metadata::Coll> {
+        self.descr.try_cast_to_coll()
     }
 
     pub fn update_child_start_time(&mut self, t: Instant) {
@@ -541,12 +551,10 @@ impl ProfilerEvent for ProxyOp {
                         "size": s.size,
                         "start_time": s.start_time / 1000,
                     });
-                    if let Some(d) = s.fifo_wait_dur_ns {
-                        r["fifo_ready_time"] = json!((s.start_time + d as u64) / 1000);
-                        r["end_time"] = json!((s.start_time + (d + s.dur_ns) as u64) / 1000);
-                    } else {
-                        r["end_time"] = json!((s.start_time + s.dur_ns as u64) / 1000);
+                    if let Some(t_ns) = s.fifo_ready_time_ns() {
+                        r["fifo_ready_time"] = json!(t_ns / 1000);
                     }
+                    r["end_time"] = json!(s.end_time_ns() / 1000);
                     r
                 })
                 .collect();
@@ -556,6 +564,7 @@ impl ProfilerEvent for ProxyOp {
 }
 
 #[derive(Debug)]
+#[repr(align(16))]
 pub struct ProxyStep {
     pub step: i32,
     pub size: usize,

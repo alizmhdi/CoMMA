@@ -102,6 +102,8 @@ pub mod proxy_event_state {
 
     pub mod v4 {
         use super::*;
+        pub const PROXYOP_IN_PROGRESS: u32 =
+            ncclProfilerEventState_t_ncclProfilerProxyOpInProgress_v4;
         pub const SEND_PEER_WAIT: u32 =
             ncclProfilerEventState_t_ncclProfilerProxyStepSendPeerWait_v4;
         pub const SEND_WAIT: u32 = ncclProfilerEventState_t_ncclProfilerProxyStepSendWait;

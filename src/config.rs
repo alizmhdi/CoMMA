@@ -36,6 +36,14 @@ macro_rules! field_from_env {
     };
 }
 
+macro_rules! default_from_compile_env {
+    ($type: tt, $env_name: literal, $d: expr) => {
+        option_env!($env_name)
+            .and_then(|s| $type::parse(s).ok())
+            .unwrap_or($d)
+    };
+}
+
 macro_rules! profiler_config {
     ($s: expr) => {
         format!("NCCL_PROFILER_{}", $s)
@@ -46,6 +54,13 @@ macro_rules! profiler_config {
 pub struct Config {
     // Basic enable / disable
     pub use_gpuviz: bool, // copybara:strip(gpuviz)
+    // copybara:strip_begin(gpuviz)
+    // the "cap" of log level we use for GPUViz logs
+    // 0: warn and error mapped to info
+    // 1: error maps to warn
+    // 2: as-is
+    pub gpuviz_log_level: usize,
+    // copybara:strip_end
 
     // Profiling granularity
     pub track_group: bool,
@@ -56,6 +71,7 @@ pub struct Config {
     pub track_recv_steps: bool,
     pub track_step_fifo_wait: bool,
     pub aggregate_steps: bool,
+    pub track_kernel_ch: bool,
     pub ncclop_completion_delay: Duration,
 
     // Performance related
@@ -78,12 +94,15 @@ pub struct Config {
     // Telemetry uploading config
     pub gpuviz_lib: String, // copybara:strip(gpuviz)
     pub telemetry_mode: usize,
+    pub heartbeat: bool,
+    pub heartbeat_upload_interval: Duration,
 }
 
 impl Config {
     fn from_env() -> Self {
         let mut s = Config::default();
         field_from_env!(s, use_gpuviz, true); // copybara:strip(gpuviz)
+        field_from_env!(s, gpuviz_log_level, 0); // copybara:strip(gpuviz)
 
         field_from_env!(s, track_group, false);
         field_from_env!(s, track_ncclop, true);
@@ -93,6 +112,7 @@ impl Config {
         field_from_env!(s, track_recv_steps, false);
         field_from_env!(s, track_step_fifo_wait, true);
         field_from_env!(s, aggregate_steps, true);
+        field_from_env!(s, track_kernel_ch, false);
         field_from_env!(s, ncclop_completion_delay, Duration::from_secs(2));
 
         field_from_env!(s, fifo_batch_size, 1024);
@@ -102,10 +122,19 @@ impl Config {
         field_from_env!(s, skip_nvls, true);
         field_from_env!(s, skip_small_collective, true);
         field_from_env!(s, skip_small_collective_steps, true);
-        field_from_env!(s, p2p_sample_rate, 1.0);
+
+        let default_sample_rate = default_from_compile_env!(f64, "DEFAULT_P2P_SAMPLE_RATE", 1.0);
+        field_from_env!(s, p2p_sample_rate, default_sample_rate);
         s.p2p_sample_rate = s.p2p_sample_rate.clamp(0.0, 1.0);
+        log::info!("P2P op sample rate: {}", s.p2p_sample_rate);
+
         field_from_env!(s, p2p_recv_sample_rate, 0.1);
+        if s.p2p_sample_rate < 1.0 && s.p2p_sample_rate > 0.0 {
+            s.p2p_recv_sample_rate /= s.p2p_sample_rate;
+        }
         s.p2p_recv_sample_rate = s.p2p_recv_sample_rate.clamp(0.0, 1.0);
+        log::info!("Recv P2P op sample rate: {}", s.p2p_recv_sample_rate);
+
         field_from_env!(s, use_cached_clock, false);
 
         field_from_env!(s, latency_file);
@@ -115,7 +144,13 @@ impl Config {
         // copybara:strip_begin(gpuviz)
         field_from_env!(s, gpuviz_lib, String::from(gpuviz::GPUVIZ_LIB_NAME));
         // copybara:strip_end
+        #[cfg(not(feature = "explicit-optin"))]
         field_from_env!(s, "NCCL_TELEMETRY_MODE", telemetry_mode, 3);
+        field_from_env!(s, heartbeat, false);
+        field_from_env!(s, heartbeat_upload_interval, Duration::from_secs(60));
+
+        #[cfg(feature = "explicit-optin")]
+        field_from_env!(s, "NCCL_TELEMETRY_MODE", telemetry_mode, 0);
 
         s
     }

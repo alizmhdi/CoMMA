@@ -15,23 +15,25 @@
 use crate::daemon::*;
 use crate::event;
 use crate::event::ProfilerEvent as _;
+use crate::gcp_acs_proto;
 use crate::gpuviz;
 use crate::histogram::{Histogram1D, Histogram2D};
 use crate::nccl_metadata::NcclOpKey;
 use crate::profiler::Profiler;
 
+use gcp_acs_proto::ntc::ActiveCommunicator;
+use gcp_acs_proto::ntc::ClosedCommunicator;
 use log::error;
 use serde_json::json;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot};
-
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
 pub struct CloudDaemon {
@@ -83,23 +85,62 @@ impl Telemetry {
             Telemetry::ProxyOp(proxyop) => {
                 writeln!(buf, "{}", proxyop.trace_record(&mut time_to_num))?;
             }
+            _ => {}
         }
         file.write_all(&buf).await
     }
 }
 
-struct CollectiveSummary<W: AsyncWriteExt> {
-    file: W,
+struct CollectiveSummary {
     count: HashMap<NcclOpKey, Histogram1D>,
     latency: HashMap<NcclOpKey, Histogram2D>,
+
+    active_comm: HashMap<u64, ActiveCommunicator>,
+    closed_comm: HashMap<u64, ClosedCommunicator>,
 }
 
-impl<W: AsyncWriteExt> CollectiveSummary<W> {
-    fn new(file: W) -> Self {
+impl CollectiveSummary {
+    fn new() -> Self {
         Self {
-            file,
             count: HashMap::new(),
             latency: HashMap::new(),
+
+            active_comm: HashMap::new(),
+            closed_comm: HashMap::new(),
+        }
+    }
+
+    fn record_op_issue(&mut self, op: &event::NcclOp) {
+        if !op.is_p2p() {
+            let key = op.op_key();
+            let comm_hash = op.comm_hash();
+            let comm = self
+                .active_comm
+                .entry(comm_hash)
+                .or_insert_with(|| ActiveCommunicator {
+                    comm_hash: Some(comm_hash),
+                    rank: Some(op.basic_info().rank() as _),
+                    coll_seq: HashMap::new(),
+                    ..Default::default()
+                });
+            let op_type = key.get_coll_op_type();
+            comm.coll_seq.insert(
+                String::from(op_type.name()),
+                op.get_coll_descr().unwrap().seq_num() as _,
+            );
+        }
+    }
+
+    fn record_comm_close(&mut self, comm_hash: u64) {
+        if let Some(active_comm) = self.active_comm.remove(&comm_hash) {
+            self.closed_comm.insert(
+                comm_hash,
+                ClosedCommunicator {
+                    comm_hash: Some(comm_hash),
+                    rank: active_comm.rank,
+                    close_time: Some(std::time::SystemTime::now().into()),
+                },
+            );
         }
     }
 
@@ -115,9 +156,9 @@ impl<W: AsyncWriteExt> CollectiveSummary<W> {
         }
     }
 
-    async fn write_to_file(&mut self) -> std::io::Result<()>
+    async fn write_to_file<W>(&mut self, file: &mut W) -> std::io::Result<()>
     where
-        W: std::marker::Unpin,
+        W: AsyncWriteExt + std::marker::Unpin,
     {
         let now = std::time::SystemTime::now();
         let mut buf: Vec<u8> = Vec::new();
@@ -159,14 +200,26 @@ impl<W: AsyncWriteExt> CollectiveSummary<W> {
             serde_json::to_string_pretty(&latency_distro).unwrap()
         )?;
 
-        self.file.write_all(&buf).await
+        file.write_all(&buf).await
     }
 
-    async fn flush(&mut self) -> std::io::Result<()>
-    where
-        W: std::marker::Unpin,
-    {
-        self.file.flush().await
+    fn generate_heartbeat(&mut self) -> gcp_acs_proto::ntc::Event {
+        use gcp_acs_proto::ntc::event::Body;
+
+        let heartbeat = gcp_acs_proto::ntc::Heartbeat {
+            active_comm: self.active_comm.values().cloned().collect(),
+            closed_comm: std::mem::take(&mut self.closed_comm)
+                .values()
+                .cloned()
+                .collect(),
+        };
+
+        gcp_acs_proto::ntc::Event {
+            telemetry_type: Some("heartbeat".into()),
+            event_creation_ts: Some(std::time::SystemTime::now().into()),
+            body: Some(Body::Heartbeat(heartbeat)),
+            ..Default::default()
+        }
     }
 }
 
@@ -207,9 +260,15 @@ async fn exporter(
         None
     };
 
-    let mut summary = if let Some(template) = profiler.config.summary_file.as_ref() {
+    let mut summary_file = if let Some(template) = profiler.config.summary_file.as_ref() {
         let path = template.replace("%p", &format!("{}", profiler.pid));
-        build_bufwriter(path).await.map(CollectiveSummary::new)
+        build_bufwriter(path).await
+    } else {
+        None
+    };
+
+    let mut summary = if summary_file.is_some() || profiler.config.heartbeat {
+        Some(CollectiveSummary::new())
     } else {
         None
     };
@@ -223,6 +282,9 @@ async fn exporter(
 
     // the very first tick completes immediately
     summary_interval.tick().await;
+
+    let mut uploader_interval = tokio::time::interval(profiler.config.heartbeat_upload_interval);
+    uploader_interval.tick().await;
 
     loop {
         tokio::select! {
@@ -242,8 +304,17 @@ async fn exporter(
                         }
 
                         if let Some(summary) = summary.as_mut() {
-                            if let Telemetry::NcclOp(op) = &telemetry {
-                                summary.add_op(op);
+                            match &telemetry {
+                                Telemetry::NcclOp(op) => {
+                                    summary.add_op(op);
+                                },
+                                Telemetry::NcclOpIssued(op) => {
+                                    summary.record_op_issue(op);
+                                },
+                                Telemetry::CommClose(comm_hash) => {
+                                    summary.record_comm_close(*comm_hash);
+                                },
+                                _ => {}
                             }
                         }
 
@@ -259,11 +330,19 @@ async fn exporter(
                 }
             },
             _ = summary_interval.tick(), if summary.is_some() => {
-                let s = summary.as_mut().unwrap();
-                let r = s.write_to_file().await;
-                if let Err(e) = r {
-                    error!("Failed to log telemetry summary to file: {}. Stop logging.", e);
-                    summary = None;
+                if let Some(file) = summary_file.as_mut() {
+                    let s = summary.as_mut().unwrap();
+                    let r = s.write_to_file(file).await;
+                    if let Err(e) = r {
+                        error!("Failed to log telemetry summary to file: {}. Stop logging.", e);
+                    }
+                }
+            },
+            _ = uploader_interval.tick(), if profiler.config.heartbeat => {
+                if summary.is_some() && gpuviz.is_some() {
+                    let summary = summary.as_mut().unwrap();
+                    let gpuviz = gpuviz.as_mut().unwrap();
+                    gpuviz.send_heartbeat(summary.generate_heartbeat());
                 }
             },
         }
@@ -274,8 +353,15 @@ async fn exporter(
     }
 
     if let Some(summary) = summary.as_mut() {
-        summary.write_to_file().await?;
-        summary.flush().await?;
+        if let Some(file) = summary_file.as_mut() {
+            summary.write_to_file(file).await?;
+            file.flush().await?;
+        }
+        if profiler.config.heartbeat {
+            if let Some(gpuviz) = gpuviz.as_mut() {
+                gpuviz.send_heartbeat(summary.generate_heartbeat());
+            }
+        }
     }
 
     Ok(())
@@ -471,7 +557,7 @@ mod tests {
         let profiler = Box::new(Profiler::new(Version::V1));
 
         std::thread::scope(|s| {
-            let (tx, rx) = mpsc::channel::<Telemetry>(n_ncclop);
+            let (tx, rx) = mpsc::channel::<Telemetry>(n_ncclop * 2);
             let stop_var = Arc::new(AtomicBool::new(false));
             let stop_var_clone = stop_var.clone();
             let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -499,7 +585,7 @@ mod tests {
     fn reclaim_eventual() {
         const N_NCCLOP: usize = 50;
 
-        reclaim_test_template(N_NCCLOP, |thread_state, barrier, rx, stop_var| {
+        reclaim_test_template(N_NCCLOP, |thread_state, barrier, mut rx, stop_var| {
             for op_idx in 0..N_NCCLOP {
                 let coll_descr = profiler_shim::tests::dummy_coll_descr();
                 let coll = slab::AllocatedNode::new(event::NcclOp::from_descr(
@@ -512,7 +598,13 @@ mod tests {
             }
             stop_var.store(true, Ordering::Release);
             barrier.wait();
-            assert_eq!(rx.len(), N_NCCLOP);
+            let mut n_reported = 0;
+            while let Some(t) = rx.blocking_recv() {
+                if std::matches!(t, daemon::Telemetry::NcclOp(_)) {
+                    n_reported += 1;
+                }
+            }
+            assert_eq!(n_reported, N_NCCLOP);
         });
     }
 
@@ -522,7 +614,7 @@ mod tests {
         let n_ncclop: usize = config.max_tracked_ncclop - 1;
         const NCCLOP_TIMEOUT: Duration = Duration::from_secs(100);
 
-        reclaim_test_template(n_ncclop, |thread_state, barrier, rx, stop_var| {
+        reclaim_test_template(n_ncclop, |thread_state, barrier, mut rx, stop_var| {
             for op_idx in 0..n_ncclop {
                 let coll_descr = profiler_shim::tests::dummy_coll_descr();
                 let coll = slab::AllocatedNode::new(event::NcclOp::from_descr(
@@ -541,7 +633,13 @@ mod tests {
             }
             stop_var.store(true, Ordering::Release);
             barrier.wait();
-            assert_eq!(rx.len(), n_ncclop);
+            let mut n_reported = 0;
+            while let Some(t) = rx.blocking_recv() {
+                if std::matches!(t, daemon::Telemetry::NcclOp(_)) {
+                    n_reported += 1;
+                }
+            }
+            assert_eq!(n_reported, n_ncclop);
         });
     }
 
@@ -550,7 +648,7 @@ mod tests {
         let config: &config::Config = &config::CONFIG;
         let n_ncclop: usize = config.max_tracked_ncclop + 1000;
 
-        reclaim_test_template(n_ncclop, |thread_state, barrier, rx, stop_var| {
+        reclaim_test_template(n_ncclop, |thread_state, barrier, mut rx, stop_var| {
             for op_idx in 0..n_ncclop {
                 let coll_descr = profiler_shim::tests::dummy_coll_descr();
                 let coll = slab::AllocatedNode::new(event::NcclOp::from_descr(
@@ -570,7 +668,13 @@ mod tests {
             }
             stop_var.store(true, Ordering::Release);
             barrier.wait();
-            assert_eq!(rx.len(), n_ncclop);
+            let mut n_reported = 0;
+            while let Some(t) = rx.blocking_recv() {
+                if std::matches!(t, daemon::Telemetry::NcclOp(_)) {
+                    n_reported += 1;
+                }
+            }
+            assert_eq!(n_reported, n_ncclop);
         });
     }
 }

@@ -21,9 +21,20 @@ use crate::profiler_shim;
 pub struct EventStep {
     pub step: i32,
     pub size: usize,
-    pub start_time: u64,
-    pub fifo_wait_dur_ns: Option<u32>,
-    pub dur_ns: u32,
+    pub start_time: u64, // start time from profiler init, in nanoseconds
+    pub fifo_wait_dur_ns: Option<u32>, // time spent waiting for CTS signal from receiver
+    pub dur_ns: u32, // for sender, this is time spent on sending data after receiving CTS from receiver
+}
+
+impl EventStep {
+    pub fn fifo_ready_time_ns(&self) -> Option<u64> {
+        self.fifo_wait_dur_ns.map(|d| self.start_time + d as u64)
+    }
+
+    pub fn end_time_ns(&self) -> u64 {
+        let fifo_dt = self.fifo_wait_dur_ns.unwrap_or(0);
+        self.start_time + (self.dur_ns + fifo_dt) as u64
+    }
 }
 
 #[derive(Debug, Copy, Clone)]

@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::event::{Event, Group, NcclOp, ProxyOp};
+use crate::event::{Event, Group, ProxyStep};
+use crate::profiler::{KernelCh, ProxyOpLocalData};
 use crate::slab;
 
 use static_assertions::const_assert;
 
 pub type Handle = *mut libc::c_void;
 
-pub const N_TYPE_BITS: u32 = 3;
+pub const N_TYPE_BITS: u32 = 4;
 pub const HANDLE_TYPE_MASK: usize = (1 << N_TYPE_BITS) - 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub enum Type {
     Dummy,
     SmallNcclOp,
     ProxyStep,
+    KernelCh,
 }
 
 impl Type {
@@ -45,6 +47,7 @@ impl Type {
             Type::Dummy => 0b101,
             Type::SmallNcclOp => 0b110,
             Type::ProxyStep => 0b111,
+            Type::KernelCh => 0b1000,
         }
     }
 
@@ -58,6 +61,7 @@ impl Type {
             0b101 => Type::Dummy,
             0b110 => Type::SmallNcclOp,
             0b111 => Type::ProxyStep,
+            0b1000 => Type::KernelCh,
             _ => panic!("unknown bit pattern"),
         }
     }
@@ -83,12 +87,17 @@ fn to_ncclop_handle(handle: Handle) -> usize {
 
 pub trait AsFFI: Sized {
     fn into_ffi(self) -> Handle;
+
+    /// # Safety
+    ///
+    /// `handle` parameter must be a valid handle returned by calling `into_ffi()`
     unsafe fn from_ffi(handle: Handle) -> Option<Self>;
 }
 
 const_assert!(std::mem::align_of::<Group>() >= (1 << N_TYPE_BITS));
-const_assert!(std::mem::align_of::<NcclOp>() >= (1 << N_TYPE_BITS));
-const_assert!(std::mem::align_of::<ProxyOp>() >= (1 << N_TYPE_BITS));
+const_assert!(std::mem::align_of::<ProxyStep>() >= (1 << N_TYPE_BITS));
+const_assert!(std::mem::align_of::<KernelCh>() >= (1 << N_TYPE_BITS));
+const_assert!(std::mem::align_of::<ProxyOpLocalData>() >= (1 << N_TYPE_BITS));
 
 impl AsFFI for Event {
     fn into_ffi(self) -> Handle {
@@ -110,12 +119,12 @@ impl AsFFI for Event {
             Event::NcclOpLite(id) => handle(id << N_TYPE_BITS, Type::NcclOpLite),
             Event::NcclOp(id) => handle(id << N_TYPE_BITS, Type::NcclOp),
             Event::ProxyOpLite(op) => {
-                /*
-                let v = ncclop << N_TYPE_BITS;
-                handle(v, Type::ProxyOpLite)
-                */
                 let ptr = slab::AllocatedNode::into_raw(op);
                 handle(ptr as _, Type::ProxyOpLite)
+            }
+            Event::KernelCh(op) => {
+                let ptr = slab::AllocatedNode::into_raw(op);
+                handle(ptr as _, Type::KernelCh)
             }
             /*
             Event::ProxyOp(id) => {
@@ -168,14 +177,14 @@ impl AsFFI for Event {
                 Some(Event::NcclOp(handle))
             }
             Type::ProxyOpLite => {
-                /*
-                let handle = get_handle_inner(handle);
-                let ncclop = handle >> N_TYPE_BITS;
-                Some(Event::ProxyOpLite(ncclop))
-                */
                 let handle = get_handle_inner(handle) as _;
                 let proxyop = slab::AllocatedNode::from_raw(handle);
                 Some(Event::ProxyOpLite(proxyop))
+            }
+            Type::KernelCh => {
+                let handle = get_handle_inner(handle) as _;
+                let proxyop = slab::AllocatedNode::from_raw(handle);
+                Some(Event::KernelCh(proxyop))
             }
             /*
             Type::ProxyOp => {
@@ -250,7 +259,7 @@ mod tests {
     #[test]
     fn ffi_handle_inv() {
         // note: the list of handles should have last N_TYPE_BITS zeroed
-        let handles = [0, 40, 1024, 0xabcd1230, 0xfffffff0];
+        let handles = [0, 48, 1024, 0xabcd1230, 0xfffffff0];
         let types = [Type::Group, Type::NcclOp, Type::ProxyOp, Type::Dummy];
         for h in handles {
             for t in types {
@@ -268,6 +277,7 @@ mod tests {
         let event = Event::new_group(&group_descr, t0);
         let handle = Event::into_ffi(event);
 
+        // SAFETY: handle is valid return value of into_ffi()
         if let Some(Event::Group(mut group)) = unsafe { Event::from_ffi(handle) } {
             assert_eq!(
                 group.basic_info().rank(),
@@ -292,11 +302,13 @@ mod tests {
         let proxyop_descr = dummy_proxyop_descr();
         let event = Event::ProxyOp(slab::AllocatedNode::new(profiler::ProxyOpLocalData::new(
             42,
+            // SAFETY: proxyop_descr is a proxyop descriptor
             unsafe { proxyop_descr.cast_to_proxyop() },
             false,
             false,
         )));
         let handle = Event::into_ffi(event);
+        // SAFETY: handle is valid return value of into_ffi()
         if let Some(Event::ProxyOp(proxydata)) = unsafe { Event::from_ffi(handle) } {
             assert_eq!(proxydata.info.id, 42);
             assert!(proxydata.info.is_send);
