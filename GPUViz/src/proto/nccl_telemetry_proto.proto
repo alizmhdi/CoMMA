@@ -1,0 +1,281 @@
+// Copyright (c) 2025 Google LLC All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+syntax = "proto2";
+
+import "google/protobuf/timestamp.proto";
+
+// package creates a namespace
+package protoDist;
+
+enum DistType {
+  // Different distribution types.
+
+  // ------------ Reported by all GPUViz versions
+
+  // Each bucket of the latency histogram is
+  // an interval of time in nanoseconds
+
+  // The time elapsed between the NCCL network plugin
+  // receiving request to send/recv a message over network
+  // until the plugin processes completion
+  // of the network transaction.
+  protoSendLatencySW = 0;
+  protoRecvLatencySW = 1;
+
+  // Pending for future implementation
+  protoSendLatencyNetHW = 2;
+  protoRecvLatencyNetHW = 3;
+  protoRecvReadylatency = 4;
+
+  // Each bucket of the message size histogram is
+  // an interval of msg sizes in Bytes
+  // Size of the messages (network transactions) NCCL core asked the network
+  // plugin to send/receive over the network.
+  protoSendMessageSize = 5;
+  protoRecvMessageSize = 6;
+  // ------------------------------------------------
+
+  // ---------------- Reported by GPUViz Versions released on/after 2024/10/17
+  // ---------------- ONLY if BW collection flag (i.e.
+  // ---------------- NCCL_GPUVIZ_BANDWIDTH_HISTOGRAM_COLLECTION_ENABLE)
+  // ---------------- is enabled.
+  // Each bucket of the bandwidth histogram is an interval of BW in bits/sec
+  // and we measure the number of short duration intervals where BW was between
+  // the bucket limit.
+  protoSendBandwidth = 7;
+  protoRecvBandwidth = 8;
+  // ---------------- Reported by GPUViz Versions released on/after 2024/11/14
+  // ---------------- ONLY if BW collection flag (i.e.
+  // ---------------- NCCL_GPUVIZ_BANDWIDTH_HISTOGRAM_COLLECTION_ENABLE)
+  // ---------------- is enabled.
+  // Each bucket of the Bandwidth Variance histogram is an interval
+  // of BW Variance(less than expected) in bits/sec
+  // and we measure the number of short duration intervals
+  // where BW variance was between the bucket limit.
+  protoBandwidthVariance = 9;
+  // Each bucket of the Latency Variance histogram is an interval
+  // of Latency Variance(greater than expected) in nanoseconds
+  // and we measure the number of short duration intervals
+  // where Latency variance was between the bucket limit.
+  protoLatencyVariance = 10;
+
+  // The maximum number of distributions currently supported, used for iterators
+  // implementation, shouldn't be used as an actual value.
+  protoTotalDistributionType = 11;
+  // ------------------------------------------------
+};
+
+message StatsDistribution {
+  // StatsDistribution is intended to provide the statistical aggregates of a
+  // specific metric over a period of time. The collection of the samples
+  // depends on the metric, but the aggregates are the same:
+  // minimum value of samples collected during the time period
+  // maximum value of samples collected during the time period
+  // mean value (average) of the samples collected during the time period
+  // number of samples collected during the time period
+  // histogram of the samples collected during the time period
+
+  // The samples are collected as follows:
+  // For latency and message size, a sample is collected for each network plugin
+  // send/receive as dictated by NCCL core. For bandwidth measurements, samples
+  // are collected at fixed time intervals (configurable), measuring the goodput
+  // observed since the last sample was collected.
+  optional DistType dist_type = 1;
+
+  optional double min = 2;
+  optional double max = 3;
+  optional double avg = 4;
+  optional int64 num_samples = 5;
+
+  // The parameters scale_factor and base are used to determine the upper and
+  // lower bounds of each bucket in the histogram.
+  // For bucket i>1, the bounds of the bucket are:
+  // [ (pow(base,i-1)*scale), (pow(base,i)*scale) )
+  // For bucket 0, it covers the range (-infinity, scale)
+  // The bucket where pow(base,i)*scale is bigger than max_bucket covers the
+  // range [pow(base,i-1)scale, infinity)
+  optional double scale_factor = 6;
+  optional double base = 7;
+  optional int64 max_bucket = 8;
+  // // The number of samples in each bucket.
+  repeated int64 bucket_counts = 9;
+  // The minimum and maximum message size for the samples collected in
+  // this histogram.
+  optional uint32 min_msg_size_bucket = 10;
+  optional uint32 max_msg_size_bucket = 11;
+};
+
+enum ncclStatsConnectionType {
+  // NV Link connection (between GPUs on the same node)
+  EntityNVLConnection = 0;
+  // PCI connection
+  EntityPCIConnection = 1;
+  // TCP connection is also used to identify a SNAP connection
+  // (as the endpoint identifiers are the same).
+  EntityTCPConnection = 2;
+  // Remote Direct Memory Access connection
+  EntityRDMAConnection = 3;
+  // Profiler Plugin connection
+  EntityProfilerPluginConnection = 4;
+};
+
+enum ncclStatsPluginType {
+  NetPlugin = 0;
+  CollNetPlugin = 1;
+  ProfilerPlugin = 2;
+};
+
+message ncclStatsNVLConnection {
+  /* TODO: NVlink support */
+};
+
+message ncclStatsPCIConnection {
+  /* TODO: PCI P2P support */
+};
+
+message ncclStatsTCPConnection {
+  optional string local_endpoint = 1;
+  optional string remote_endpoint = 2;
+};
+
+message ncclStatsRDMAConnection {
+  optional string local_endpoint = 1;
+  optional int32 local_qpn = 2;
+  optional string remote_endpoint = 3;
+  optional int32 remote_qpn = 4;
+};
+
+message ncclStatsProfilerPluginConnection {
+  // Format: local IP-address.
+  optional string local_network_endpoint = 1;
+  // If available, the communicator hash used for this collective/communication.
+  optional uint64 local_comm_hash = 2;
+  // Local rank number for P2P telemetry (proxy op level or p2p operation).
+  optional uint32 local_rank = 3;
+  // Remote rank number for P2P telemetry (proxy op level or p2p operation).
+  // If statistics are for a collective operation, identifies the root rank for
+  // the operation.
+  optional uint32 remote_or_root_rank = 4;
+  optional string collective_type = 5;
+  optional string collective_algorithm = 6;
+  optional string description = 7;
+};
+
+message ncclStatsConnection {
+  // For each connection, the type of connection as well as detailed connection
+  // info such as local and remote endpoint.
+  optional ncclStatsConnectionType conn_type = 1;
+  // Only one of the following will have data based on type of connection.
+  optional ncclStatsNVLConnection nvl_conn = 2;
+  optional ncclStatsPCIConnection pci_conn = 3;
+  optional ncclStatsTCPConnection tcp_conn = 4;
+  optional ncclStatsRDMAConnection rdma_conn = 5;
+  optional ncclStatsProfilerPluginConnection profiler_conn = 6;
+};
+
+message PluginVersion {
+  optional int32 major = 1;
+  optional int32 minor = 2;
+};
+
+message ConnectionIdentifier {
+  optional ncclStatsConnection connection = 1;
+  optional ncclStatsPluginType nccl_plugin_type = 2;
+  optional string nccl_plugin_name = 3;
+  optional string gpu_pci_addr = 4;
+  optional PluginVersion plugin_version = 5;
+};
+
+message ConnectionStats {
+  // For a single connection and time interval, a set of histograms of collected
+  // telemetry.
+  optional ConnectionIdentifier connection_id = 1;
+  // The time when this ConnectionStats structure was reported to the telemetry
+  // stream
+  optional google.protobuf.Timestamp time_stamp = 2;
+  // Field ID 3 is reserved for historical reasons.
+  repeated StatsDistribution histogram = 4;
+}
+
+message LogEntry {
+  // If connection_id is not present - global log entry
+  optional ConnectionIdentifier connection_id = 1;
+  optional google.protobuf.Timestamp time_stamp = 2;
+  // An integer code identifying the category of the log entry, to aid in
+  // processing of events. Category IDs will be assigned at a later time, and
+  // documented here as a comment.
+  optional int32 entry_category = 3;
+  // An integer code identifying the message type of the entry within the
+  // category. Goal is to simplify processing and filtering, and enable tools to
+  // skip entries that are not relevant to them without having to do string
+  // parsing.
+  optional int32 entry_message_id = 4;
+  optional string category_name = 5;
+  optional string event_message = 6;
+  optional int32 severity = 7;
+}
+
+message CollectiveRecord {
+  optional string name = 1;
+  optional string algorithm = 2;
+  optional string protocol = 3;
+  optional uint64 msg_size = 4;
+
+  optional google.protobuf.Timestamp start_time = 5;
+  // Absense of stop_time could be used to indicate failure of the collective
+  optional google.protobuf.Timestamp stop_time = 6;
+
+};
+
+message ActiveCommunicator {
+  optional uint64 comm_hash = 1;
+  optional uint32 rank = 2;
+  map<string, uint64> coll_seq = 3;
+  map<string, uint64> coll_net_bytes = 4;
+  map<uint32, uint64> issued_p2p_send_bytes = 5;
+  map<uint32, uint64> issued_p2p_recv_bytes = 6;
+};
+
+message ClosedCommunicator {
+  optional uint64 comm_hash = 1;
+  optional uint32 rank = 2;
+  optional google.protobuf.Timestamp close_time = 3;
+};
+
+message Heartbeat {
+  repeated ActiveCommunicator active_comm = 1;
+  repeated ClosedCommunicator closed_comm = 2;
+};
+
+message Event {
+  optional string telemetry_type = 1; // by use-case
+  optional string shard_key = 2;
+  optional google.protobuf.Timestamp event_creation_ts = 3;
+  optional PluginVersion plugin_version = 6;
+
+  oneof body {
+    CollectiveRecord collective_record = 4;
+    Heartbeat heartbeat = 5;
+  }
+};
+
+
+
+message AllStats {
+  // An array of connection stats that have been collected.
+  repeated ConnectionStats conn_stats = 1; // todo: move to Event
+  // An array of event logs, reporting events since last reporting period.
+  // Currently no log entries are reported.
+  repeated LogEntry events_log = 2; // todo: move to Event
+  // String format: PID:process_start_time_in_microseconds_from_epoch:random_uint64.
+  optional string source_process_identifier = 3;
+  // Index of each uploaded message. This field will be filled iff the upload
+  // of telemetry is enabled, which allows to monitor msg delivery internally.
+  // source_process_identifier + upload_index would be an unique identifier
+  // within a single VM for each message.
+  optional uint64 upload_index = 4;
+  // Telemetry events.
+  repeated Event events = 5;
+};
