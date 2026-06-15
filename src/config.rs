@@ -73,6 +73,7 @@ pub struct Config {
     pub aggregate_steps: bool,
     pub track_kernel_ch: bool,
     pub ncclop_completion_delay: Duration,
+    pub comm_hash_ipc_timeout: Duration,
 
     // Performance related
     pub fifo_batch_size: usize,
@@ -96,6 +97,18 @@ pub struct Config {
     pub telemetry_mode: usize,
     pub heartbeat: bool,
     pub heartbeat_upload_interval: Duration,
+    pub heartbeat_collective_progress: bool,
+
+    // OpenTelemetry config
+    pub otel_enable: bool,
+    pub otel_trace_ncclop: bool,
+    // opentelemetry base2 histogram parameters
+    // see https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/metrics/sdk.md#base2-exponential-bucket-histogram-aggregation
+    // for more detail
+    pub otel_metrics_max_cardinality: usize,
+    pub otel_metrics_cardinality_grouping_interval: Duration,
+    pub otel_latency_histogram_max_size: u32,
+    pub otel_latency_histogram_max_scale: u32,
 }
 
 impl Config {
@@ -107,13 +120,14 @@ impl Config {
         field_from_env!(s, track_group, false);
         field_from_env!(s, track_ncclop, true);
         field_from_env!(s, track_proxyop, false);
-        field_from_env!(s, track_interprocess_proxyop, false);
+        field_from_env!(s, track_interprocess_proxyop, true);
         field_from_env!(s, track_steps, false);
         field_from_env!(s, track_recv_steps, false);
         field_from_env!(s, track_step_fifo_wait, true);
         field_from_env!(s, aggregate_steps, true);
         field_from_env!(s, track_kernel_ch, false);
         field_from_env!(s, ncclop_completion_delay, Duration::from_secs(2));
+        field_from_env!(s, comm_hash_ipc_timeout, Duration::from_secs(1));
 
         field_from_env!(s, fifo_batch_size, 1024);
         field_from_env!(s, ncclop_timeout, Duration::from_secs(10));
@@ -146,11 +160,27 @@ impl Config {
         // copybara:strip_end
         #[cfg(not(feature = "explicit-optin"))]
         field_from_env!(s, "NCCL_TELEMETRY_MODE", telemetry_mode, 3);
-        field_from_env!(s, heartbeat, false);
-        field_from_env!(s, heartbeat_upload_interval, Duration::from_secs(60));
+        field_from_env!(s, heartbeat, true);
+        field_from_env!(s, heartbeat_upload_interval, Duration::from_secs(1));
+        field_from_env!(s, heartbeat_collective_progress, false);
+        if !s.heartbeat && s.heartbeat_collective_progress {
+            log::info!("Must enable NCCL_PROFILER_HEARTBEAT to enable NCCL_PROFILER_HEARTBEAT_COLLECTIVE_PROGRESS. Disabling NCCL_PROFILER_HEARTBEAT_COLLECTIVE_PROGRESS.");
+            s.heartbeat_collective_progress = false;
+        }
 
         #[cfg(feature = "explicit-optin")]
         field_from_env!(s, "NCCL_TELEMETRY_MODE", telemetry_mode, 0);
+
+        field_from_env!(s, otel_enable, false);
+        field_from_env!(s, otel_trace_ncclop, false);
+        field_from_env!(s, otel_metrics_max_cardinality, 0);
+        field_from_env!(
+            s,
+            otel_metrics_cardinality_grouping_interval,
+            Duration::from_secs(3600)
+        );
+        field_from_env!(s, otel_latency_histogram_max_size, 160);
+        field_from_env!(s, otel_latency_histogram_max_scale, 20);
 
         s
     }
@@ -175,6 +205,7 @@ macro_rules! default_config_parser {
 
 default_config_parser!(String);
 default_config_parser!(usize);
+default_config_parser!(u32);
 default_config_parser!(f64);
 
 impl FromConfigStr for bool {

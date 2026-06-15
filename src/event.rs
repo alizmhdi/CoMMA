@@ -17,6 +17,7 @@ use crate::event_ffi;
 use crate::nccl_metadata;
 use crate::nccl_metadata::NcclOpKey;
 use crate::profiler;
+use crate::profiler::Communicator;
 use crate::profiler_shim;
 use crate::slab;
 use crate::step_tracker::EventStep;
@@ -141,10 +142,11 @@ pub struct ProxyOpInfo {
     pub id: u32,
     pub peer: u32,
     pub is_send: bool,
+    pub comm: Option<Communicator>,
 }
 
 impl ProxyOpInfo {
-    pub fn from_descr<E>(descr: &E, id: u32) -> Self
+    pub fn from_descr<E>(descr: &E, id: u32, comm: Option<Communicator>) -> Self
     where
         E: nccl_metadata::ProxyOp,
     {
@@ -155,6 +157,7 @@ impl ProxyOpInfo {
             id,
             peer: descr.peer() as _,
             is_send: descr.is_send(),
+            comm,
         }
     }
 
@@ -269,7 +272,7 @@ impl NcclOp {
         self.id
     }
 
-    pub fn _get_descr(&self) -> &nccl_metadata::EventMetadata {
+    pub fn get_descr(&self) -> &nccl_metadata::EventMetadata {
         &self.descr
     }
 
@@ -401,7 +404,7 @@ impl ProxyOp {
         let basic_info = BasicInfo::from_descr(descr, time);
         Self {
             basic_info,
-            info: ProxyOpInfo::from_descr(descr, 0),
+            info: ProxyOpInfo::from_descr(descr, 0, Some(profiler::Communicator::new())),
             extra: Some(ProxyOpExtra::from_descr(descr)),
             tracking_time: true,
             step_histograms: Vec::new(),
@@ -467,6 +470,10 @@ impl ProxyOp {
 
     pub fn has_step_histograms(&self) -> bool {
         !self.step_histograms.is_empty()
+    }
+
+    pub fn aggregate_steps(&self) -> bool {
+        self.aggregate_steps
     }
 
     pub fn init_step_tracking(&mut self, track_steps: bool, aggregate_steps: bool) {

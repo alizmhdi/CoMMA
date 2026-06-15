@@ -18,17 +18,23 @@ use crate::event::ProfilerEvent as _;
 use crate::gcp_acs_proto;
 use crate::gpuviz;
 use crate::histogram::{Histogram1D, Histogram2D};
+use crate::nccl_metadata;
 use crate::nccl_metadata::NcclOpKey;
-use crate::profiler::Profiler;
+use crate::otel_utils;
+use crate::profiler::{Communicator, Profiler};
+use crate::step_tracker::EventStep;
 
 use gcp_acs_proto::ntc::ActiveCommunicator;
 use gcp_acs_proto::ntc::ClosedCommunicator;
+
 use log::error;
+use opentelemetry::global::BoxedTracer as OtelTracer;
+use opentelemetry::metrics::Gauge as OtelGauge;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -91,12 +97,21 @@ impl Telemetry {
     }
 }
 
+#[derive(Clone)]
+struct ActiveComm {
+    active_comm: ActiveCommunicator,
+    total_net_bytes: Option<Arc<AtomicUsize>>,
+}
+
 struct CollectiveSummary {
     count: HashMap<NcclOpKey, Histogram1D>,
     latency: HashMap<NcclOpKey, Histogram2D>,
 
-    active_comm: HashMap<u64, ActiveCommunicator>,
+    active_comm: HashMap<u64, ActiveComm>,
     closed_comm: HashMap<u64, ClosedCommunicator>,
+
+    plugin_major: Option<i32>,
+    plugin_minor: Option<i32>,
 }
 
 impl CollectiveSummary {
@@ -107,6 +122,9 @@ impl CollectiveSummary {
 
             active_comm: HashMap::new(),
             closed_comm: HashMap::new(),
+
+            plugin_major: Some(env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0)),
+            plugin_minor: Some(env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0)),
         }
     }
 
@@ -117,17 +135,49 @@ impl CollectiveSummary {
             let comm = self
                 .active_comm
                 .entry(comm_hash)
-                .or_insert_with(|| ActiveCommunicator {
-                    comm_hash: Some(comm_hash),
-                    rank: Some(op.basic_info().rank() as _),
+                .or_insert_with(|| ActiveComm {
+                    active_comm: ActiveCommunicator {
+                        comm_hash: Some(comm_hash),
+                        coll_seq: HashMap::new(),
+                        ..Default::default()
+                    },
+                    total_net_bytes: None,
+                });
+            let active_comm = &mut comm.active_comm;
+            active_comm.rank = Some(op.basic_info().rank() as _);
+            let name = key.get_coll_op_type().name();
+            let descr = op.get_coll_descr().unwrap();
+            let algo = nccl_metadata::algo::name(descr.algo());
+            active_comm
+                .coll_seq
+                .insert(String::from(name), descr.seq_num());
+            active_comm
+                .coll_last_algo
+                .insert(String::from(name), String::from(algo));
+            active_comm
+                .coll_last_op_size
+                .insert(String::from(name), op.byte_count() as _);
+        }
+    }
+
+    fn record_comm_open(&mut self, comm: Communicator) {
+        let comm_hash = comm.comm_hash;
+        if comm_hash.is_none() {
+            return;
+        }
+        let active_comm = self
+            .active_comm
+            .entry(comm_hash.unwrap())
+            .or_insert_with(|| ActiveComm {
+                active_comm: ActiveCommunicator {
+                    comm_hash,
                     coll_seq: HashMap::new(),
                     ..Default::default()
-                });
-            let op_type = key.get_coll_op_type();
-            comm.coll_seq.insert(
-                String::from(op_type.name()),
-                op.get_coll_descr().unwrap().seq_num() as _,
-            );
+                },
+                total_net_bytes: None,
+            });
+        if active_comm.total_net_bytes.is_none() {
+            active_comm.total_net_bytes = Some(comm.total_net_bytes);
         }
     }
 
@@ -137,7 +187,7 @@ impl CollectiveSummary {
                 comm_hash,
                 ClosedCommunicator {
                     comm_hash: Some(comm_hash),
-                    rank: active_comm.rank,
+                    rank: active_comm.active_comm.rank,
                     close_time: Some(std::time::SystemTime::now().into()),
                 },
             );
@@ -203,22 +253,57 @@ impl CollectiveSummary {
         file.write_all(&buf).await
     }
 
-    fn generate_heartbeat(&mut self) -> gcp_acs_proto::ntc::Event {
+    fn generate_heartbeat(
+        &mut self,
+        remote_comm_bytes: &Option<Arc<AtomicUsize>>,
+    ) -> gcp_acs_proto::ntc::Event {
         use gcp_acs_proto::ntc::event::Body;
 
-        let heartbeat = gcp_acs_proto::ntc::Heartbeat {
-            active_comm: self.active_comm.values().cloned().collect(),
+        let mut heartbeat = gcp_acs_proto::ntc::Heartbeat {
+            active_comm: self
+                .active_comm
+                .values()
+                .map(|comm| {
+                    let mut active_comm = comm.active_comm.clone();
+                    if let Some(size) = comm.total_net_bytes.as_ref() {
+                        active_comm
+                            .coll_net_bytes
+                            .insert(String::from("total"), load_usize_as_u64(size));
+                    }
+                    active_comm
+                })
+                .collect(),
             closed_comm: std::mem::take(&mut self.closed_comm)
                 .values()
                 .cloned()
                 .collect(),
+            remote_comm_bytes: None,
         };
+
+        if let Some(remote_comm_bytes) = remote_comm_bytes {
+            heartbeat.remote_comm_bytes = Some(load_usize_as_u64(remote_comm_bytes));
+        }
 
         gcp_acs_proto::ntc::Event {
             telemetry_type: Some("heartbeat".into()),
             event_creation_ts: Some(std::time::SystemTime::now().into()),
+            plugin_version: Some(gcp_acs_proto::ntc::PluginVersion {
+                major: self.plugin_major,
+                minor: self.plugin_minor,
+            }),
             body: Some(Body::Heartbeat(heartbeat)),
             ..Default::default()
+        }
+    }
+}
+
+fn load_usize_as_u64(val: &Arc<AtomicUsize>) -> u64 {
+    let val = val.load(Ordering::Relaxed);
+    match val.try_into() {
+        Ok(total) => total,
+        Err(e) => {
+            error!("Failed to convert usize {} to u64. {}", val, e);
+            0
         }
     }
 }
@@ -252,6 +337,7 @@ async fn build_bufwriter(
 async fn exporter(
     profiler: &'static Profiler,
     mut rx: mpsc::Receiver<Telemetry>,
+    otel_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
 ) -> std::io::Result<()> {
     let mut latency_file = if let Some(template) = profiler.config.latency_file.as_ref() {
         let path = template.replace("%p", &format!("{}", profiler.pid));
@@ -278,6 +364,20 @@ async fn exporter(
         .clone()
         .map(gpuviz::HistogramManager::new);
 
+    let mut otel_tracer: Option<OtelTracer> =
+        if profiler.config.otel_enable && profiler.config.otel_trace_ncclop {
+            Some(opentelemetry::global::tracer("CoMMA"))
+        } else {
+            None
+        };
+
+    let mut otel_seqnum_gauge: Option<OtelGauge<i64>> = if profiler.config.otel_enable {
+        let meter = opentelemetry::global::meter("nccl");
+        Some(meter.i64_gauge("nccl.collective.seq_num").build())
+    } else {
+        None
+    };
+
     let mut summary_interval = tokio::time::interval(profiler.config.summary_interval);
 
     // the very first tick completes immediately
@@ -285,6 +385,15 @@ async fn exporter(
 
     let mut uploader_interval = tokio::time::interval(profiler.config.heartbeat_upload_interval);
     uploader_interval.tick().await;
+
+    let mut otel_metrics_grouping_interval = if profiler.config.otel_enable {
+        let mut i =
+            tokio::time::interval(profiler.config.otel_metrics_cardinality_grouping_interval);
+        i.tick().await;
+        Some(i)
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -311,6 +420,9 @@ async fn exporter(
                                 Telemetry::NcclOpIssued(op) => {
                                     summary.record_op_issue(op);
                                 },
+                                Telemetry::CommOpen(comm) => {
+                                    summary.record_comm_open(comm.clone());
+                                }
                                 Telemetry::CommClose(comm_hash) => {
                                     summary.record_comm_close(*comm_hash);
                                 },
@@ -323,6 +435,18 @@ async fn exporter(
                                 let _ = gpuviz.add_ncclop(op, |t| {
                                     profiler.instant_to_timestamp(*t).as_nanos() as _
                                 });
+                            }
+                        }
+
+                        if let Some(otel_tracer) = otel_tracer.as_mut() {
+                            if let Telemetry::NcclOp(op) = &telemetry {
+                                let _ = otel_utils::add_ncclop_trace(otel_tracer, profiler, op);
+                            }
+                        }
+
+                        if let Some(gauge) = otel_seqnum_gauge.as_mut() {
+                            if let Telemetry::NcclOpIssued(op) = &telemetry {
+                                let _ = otel_utils::record_ncclop_seqnum(gauge, profiler, op);
                             }
                         }
                     },
@@ -342,7 +466,14 @@ async fn exporter(
                 if summary.is_some() && gpuviz.is_some() {
                     let summary = summary.as_mut().unwrap();
                     let gpuviz = gpuviz.as_mut().unwrap();
-                    gpuviz.send_heartbeat(summary.generate_heartbeat());
+                    gpuviz.send_heartbeat(summary.generate_heartbeat(&profiler.remote_net_bytes));
+                }
+            },
+            _ = async { otel_metrics_grouping_interval.as_mut().unwrap().tick().await }, if otel_metrics_grouping_interval.is_some() => {
+                if let Some(manager) = otel_latency_hist_manager.as_ref() {
+                    if let Ok(mut inner) = manager.lock() {
+                        inner.update_priority();
+                    }
                 }
             },
         }
@@ -359,7 +490,7 @@ async fn exporter(
         }
         if profiler.config.heartbeat {
             if let Some(gpuviz) = gpuviz.as_mut() {
-                gpuviz.send_heartbeat(summary.generate_heartbeat());
+                gpuviz.send_heartbeat(summary.generate_heartbeat(&profiler.remote_net_bytes));
             }
         }
     }
@@ -367,10 +498,29 @@ async fn exporter(
     Ok(())
 }
 
-impl Export for mpsc::Sender<Telemetry> {
+struct Exporter {
+    tx: mpsc::Sender<Telemetry>,
+    otel_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
+    gpuviz: Option<Mutex<gpuviz::HistogramManager<Arc<gpuviz::Connection>>>>,
+    track_step_fifo_wait: bool,
+}
+
+impl Exporter {
+    #[cfg(test)]
+    fn new(tx: mpsc::Sender<Telemetry>) -> Self {
+        Self {
+            tx,
+            otel_latency_hist_manager: None,
+            gpuviz: None,
+            track_step_fifo_wait: false,
+        }
+    }
+}
+
+impl Export for Exporter {
     fn export(&self, ctx: &mut PollingContext, maybe_retry_ms: Option<u64>) {
         while let Some(telemetry) = ctx.pending_telemetry.pop_front() {
-            if let Err(err) = self.try_send(telemetry) {
+            if let Err(err) = self.tx.try_send(telemetry) {
                 match err {
                     TrySendError::Full(v) => {
                         ctx.pending_telemetry.push_front(v);
@@ -392,21 +542,83 @@ impl Export for mpsc::Sender<Telemetry> {
             }
         }
     }
+
+    fn get_latency_histogram(
+        &self,
+        key: &NcclOpKey,
+    ) -> Option<impl std::iter::IntoIterator<Item = Arc<dyn AtomicHistogram<EventStep>>>> {
+        let mut histograms: Vec<Arc<dyn AtomicHistogram<EventStep>>> = Vec::new();
+        if let Some(manager) = self.otel_latency_hist_manager.as_ref() {
+            if let Ok(mut lg) = manager.lock() {
+                let h = Arc::new(lg.get_histogram(key.clone()));
+                histograms.push(h as _);
+            }
+        }
+        if let Some(gpuviz_mutex) = self.gpuviz.as_ref() {
+            if let Ok(mut gpuviz) = gpuviz_mutex.lock() {
+                if self.track_step_fifo_wait {
+                    if let Ok(h) = gpuviz.get_connection(key, Some(gpuviz::ConnectionType::Net)) {
+                        histograms.push(h.clone() as _);
+                    }
+                    if let Ok(h) = gpuviz.get_connection(key, Some(gpuviz::ConnectionType::E2e)) {
+                        histograms.push(h.clone() as _);
+                    }
+                    if let Ok(h) = gpuviz.get_connection(key, Some(gpuviz::ConnectionType::Cts)) {
+                        histograms.push(h.clone() as _);
+                    }
+                } else if let Ok(h) = gpuviz.get_connection(key, None) {
+                    histograms.push(h.clone() as _);
+                }
+            }
+        }
+        if histograms.is_empty() {
+            None
+        } else {
+            Some(histograms)
+        }
+    }
 }
 
 async fn main_loop(
     profiler: &'static Profiler,
     stop: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    if profiler.config.otel_enable {
+        if otel_utils::init_meter_provider(&profiler.config).is_none() {
+            log::warn!("failed to init otel meter provider");
+        }
+        if otel_utils::init_tracer_provider(&profiler.config).is_none() {
+            log::warn!("failed to init otel tracer provider");
+        }
+    }
     const TELEMETRY_CHANNEL_SZ: usize = 4096;
     let (tx, rx) = mpsc::channel::<Telemetry>(TELEMETRY_CHANNEL_SZ);
-    let exporter = tokio::task::spawn(exporter(profiler, rx));
+    let otel_latency_hist_manager = if profiler.config.otel_enable {
+        Some(Arc::new(Mutex::new(otel_utils::HistogramManager::new(
+            "nccl.net_send.latency",
+            "ns",
+            profiler.config.otel_metrics_max_cardinality,
+        ))))
+    } else {
+        None
+    };
+    let export_worker =
+        tokio::task::spawn(exporter(profiler, rx, otel_latency_hist_manager.clone()));
+    let exporter = Exporter {
+        tx,
+        otel_latency_hist_manager,
+        gpuviz: profiler
+            .gpuviz_lib
+            .as_ref()
+            .map(|lib| Mutex::new(gpuviz::HistogramManager::new(lib.clone()))),
+        track_step_fifo_wait: profiler.config.track_step_fifo_wait,
+    };
 
     let stop_signal = Arc::new(AtomicBool::new(false));
     let stop_signal_clone = stop_signal.clone();
     let polling_worker = tokio::task::spawn_blocking(move || {
         let mut polling_ctx = PollingContext::new(profiler, stop_signal_clone);
-        polling_loop(&mut polling_ctx, tx)
+        polling_loop(&mut polling_ctx, exporter)
     });
 
     let stop_signal_copy = stop_signal.clone();
@@ -427,7 +639,7 @@ async fn main_loop(
     if let Some(t) = timer_tick {
         let _ = t.join();
     }
-    exporter.await??;
+    export_worker.await??;
     Ok(())
 }
 
@@ -483,7 +695,13 @@ mod tests {
             ));
             let proxyop_descr_casted = unsafe { proxyop_descr.cast_to_proxyop() };
             let proxyops: Vec<_> = (0..N_PROXYOP)
-                .map(|id| event::ProxyOpInfo::from_descr(proxyop_descr_casted, id as u32))
+                .map(|id| {
+                    event::ProxyOpInfo::from_descr(
+                        proxyop_descr_casted,
+                        id as u32,
+                        Some(Communicator::new()),
+                    )
+                })
                 .collect();
 
             thread_state.send_to_daemon(Message::Group(group), true);
@@ -565,7 +783,7 @@ mod tests {
             let profiler_ref = &profiler;
             s.spawn(move || {
                 let mut ctx = PollingContext::new(profiler_ref, stop_var_clone);
-                polling_loop(&mut ctx, tx);
+                polling_loop(&mut ctx, Exporter::new(tx));
                 barr.wait();
                 assert_eq!(ctx.ncclops.len(), 0);
                 barr.wait();

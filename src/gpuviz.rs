@@ -58,6 +58,7 @@ pub type Measurement = shim::ncclStatsOperationMetric;
 pub const GPUVIZ_LIB_NAME: &str = "libGPUViz.so";
 const GPUVIZ_ROOT_SYMBOL: &[u8] = b"nccl_telemetry_stats_plugin_v1\0";
 const GPUVIZ_ROOT_SYMBOL_V2: &[u8] = b"nccl_telemetry_stats_plugin_v2\0";
+const GPUVIZ_ROOT_SYMBOL_V3: &[u8] = b"nccl_telemetry_stats_plugin_v3\0";
 
 type NotifyFn = unsafe extern "C" fn(
     stats_connection_handle: usize,
@@ -71,18 +72,20 @@ type NotifyEventFn = unsafe extern "C" fn(
 ) -> shim::ncclResult_t;
 
 #[derive(Debug)]
-enum GpuvVizApi {
+enum GpuVizApi {
     V1(*mut shim::ncclStatsPlugin_v1_t),
     V2(*mut shim::ncclStatsPlugin_v2_t),
+    V3(*mut shim::ncclStatsPlugin_v3_t),
 }
 
-impl GpuvVizApi {
+impl GpuVizApi {
     fn notify_operation_measurement(&self) -> NotifyFn {
         // SAFETY: not null upon construciton
         unsafe {
             match *self {
-                GpuvVizApi::V1(plugin) => (*plugin).notifyOperationMeasurement.unwrap(),
-                GpuvVizApi::V2(plugin) => (*plugin).notifyOperationMeasurement.unwrap(),
+                GpuVizApi::V1(plugin) => (*plugin).notifyOperationMeasurement.unwrap(),
+                GpuVizApi::V2(plugin) => (*plugin).notifyOperationMeasurement.unwrap(),
+                GpuVizApi::V3(plugin) => (*plugin).notifyOperationMeasurement.unwrap(),
             }
         }
     }
@@ -91,8 +94,9 @@ impl GpuvVizApi {
         // SAFETY: not null upon construciton
         unsafe {
             match *self {
-                GpuvVizApi::V1(_) => None,
-                GpuvVizApi::V2(plugin) => (*plugin).notifyProfilerEvent,
+                GpuVizApi::V1(_) => None,
+                GpuVizApi::V2(plugin) => (*plugin).notifyProfilerEvent,
+                GpuVizApi::V3(plugin) => (*plugin).notifyProfilerEvent,
             }
         }
     }
@@ -101,7 +105,7 @@ impl GpuvVizApi {
 #[derive(Debug)]
 pub struct GpuViz {
     _lib_handle: libloading::Library,
-    api: GpuvVizApi,
+    api: GpuVizApi,
     stats_handle: libc::uintptr_t,
     epoch_dt: u64,
 }
@@ -169,16 +173,21 @@ impl GpuViz {
         // routines.
         unsafe {
             let lib = libloading::Library::new(&path_osstr).map_err(convert_err)?;
-            let v2_symbol: Option<libloading::Symbol<*mut shim::ncclStatsPlugin_v2_t>> =
-                lib.get(GPUVIZ_ROOT_SYMBOL_V2).ok();
-            let api = match v2_symbol {
-                Some(v2_symbol) => GpuvVizApi::V2(v2_symbol.into_raw().as_raw_ptr().cast()),
-                None => {
-                    let v1_symbol: libloading::Symbol<*mut shim::ncclStatsPlugin_t> =
-                        lib.get(GPUVIZ_ROOT_SYMBOL).map_err(convert_err)?;
-                    GpuvVizApi::V1(v1_symbol.into_raw().as_raw_ptr().cast())
-                }
-            };
+            let api = lib
+                .get::<*mut shim::ncclStatsPlugin_v3_t>(GPUVIZ_ROOT_SYMBOL_V3)
+                .ok()
+                .map(|s| GpuVizApi::V3(s.into_raw().as_raw_ptr().cast()))
+                .or_else(|| {
+                    lib.get::<*mut shim::ncclStatsPlugin_v2_t>(GPUVIZ_ROOT_SYMBOL_V2)
+                        .ok()
+                        .map(|s| GpuVizApi::V2(s.into_raw().as_raw_ptr().cast()))
+                })
+                .or_else(|| {
+                    lib.get::<*mut shim::ncclStatsPlugin_t>(GPUVIZ_ROOT_SYMBOL)
+                        .ok()
+                        .map(|s| GpuVizApi::V1(s.into_raw().as_raw_ptr().cast()))
+                })
+                .ok_or_else(|| std::io::Error::other("Could not find any GPUViz plugin symbol"))?;
             let handle = Self::init(&api)?;
 
             let r = Self {
@@ -195,7 +204,7 @@ impl GpuViz {
         Self::from_path(&config::CONFIG.gpuviz_lib, epoch_dt)
     }
 
-    fn init(api: &GpuvVizApi) -> std::io::Result<libc::uintptr_t> {
+    fn init(api: &GpuVizApi) -> std::io::Result<libc::uintptr_t> {
         // SAFETY: calling FFI function (expected to be MT safe)
         unsafe {
             LOGGER_INIT.call_once(|| {
@@ -207,16 +216,25 @@ impl GpuViz {
                 | shim::ncclStatsDistributionType_SendMessageSize
                 | shim::ncclStatsDistributionType_RecvMessageSize;
             let r = match *api {
-                GpuvVizApi::V1(plugin) => (*plugin).init.unwrap()(
+                GpuVizApi::V1(plugin) => (*plugin).init.unwrap()(
                     Some(c_helpers::logger_helper),
                     distribution_bitmap as _,
                     handle.as_mut_ptr(),
                 ),
-                GpuvVizApi::V2(plugin) => (*plugin).init.unwrap()(
+                GpuVizApi::V2(plugin) => (*plugin).init.unwrap()(
                     Some(c_helpers::logger_helper),
                     distribution_bitmap as _,
                     config::CONFIG.telemetry_mode as _,
                     c"Profiler".as_ptr(),
+                    handle.as_mut_ptr(),
+                ),
+                GpuVizApi::V3(plugin) => (*plugin).init.unwrap()(
+                    Some(c_helpers::logger_helper),
+                    distribution_bitmap as _,
+                    config::CONFIG.telemetry_mode as _,
+                    c"Profiler".as_ptr(),
+                    env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
+                    env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
                     handle.as_mut_ptr(),
                 ),
             };
@@ -237,8 +255,9 @@ impl GpuViz {
         let conn_handle = unsafe {
             let mut handle = MaybeUninit::uninit();
             let add_connection = match self.api {
-                GpuvVizApi::V1(plugin) => (*plugin).addConnection,
-                GpuvVizApi::V2(plugin) => (*plugin).addConnection,
+                GpuVizApi::V1(plugin) => (*plugin).addConnection,
+                GpuVizApi::V2(plugin) => (*plugin).addConnection,
+                GpuVizApi::V3(plugin) => (*plugin).addConnection,
             };
             let r = add_connection.unwrap()(
                 self.stats_handle,
@@ -267,8 +286,9 @@ impl std::ops::Drop for GpuViz {
         // needed to stop infinite retry
         unsafe {
             let destroy = match self.api {
-                GpuvVizApi::V1(plugin) => (*plugin).destroy,
-                GpuvVizApi::V2(plugin) => (*plugin).destroy,
+                GpuVizApi::V1(plugin) => (*plugin).destroy,
+                GpuVizApi::V2(plugin) => (*plugin).destroy,
+                GpuVizApi::V3(plugin) => (*plugin).destroy,
             };
             let r = destroy.unwrap()(self.stats_handle);
             debug_assert_eq!(r, shim::ncclResult_t_ncclSuccess);
@@ -297,6 +317,15 @@ impl Connection {
     pub fn notify_profiler_event(&self, msg: *const u8, len: usize) -> std::io::Result<()> {
         // SAFETY: calling FFI function (expected to be MT safe)
         unsafe {
+            if self.notify_profiler_event.is_none() {
+                static WARN_LOG: std::sync::Once = std::sync::Once::new();
+                WARN_LOG.call_once(|| {
+                    log::warn!("cloud not load notify_profiler_event callback");
+                });
+                return Err(std::io::Error::other(
+                    "gpuviz notifyProfilerEvent not available",
+                ));
+            }
             let api = self.notify_profiler_event.unwrap();
             let r = api(self.handle, msg, len);
             if r == shim::ncclResult_t_ncclSuccess {
@@ -354,8 +383,9 @@ impl std::ops::Drop for Connection {
             let close_type = shim::ncclStatsConnectionCloseType_ConnectionCloseRemoteTerminate;
             let reason: &CStr = c"Drop";
             let delete_connection = match self.gpuviz.api {
-                GpuvVizApi::V1(plugin) => (*plugin).deleteConnection,
-                GpuvVizApi::V2(plugin) => (*plugin).deleteConnection,
+                GpuVizApi::V1(plugin) => (*plugin).deleteConnection,
+                GpuVizApi::V2(plugin) => (*plugin).deleteConnection,
+                GpuVizApi::V3(plugin) => (*plugin).deleteConnection,
             };
             let r = delete_connection.unwrap()(self.handle, close_type, reason.as_ptr());
             debug_assert_eq!(r, shim::ncclResult_t_ncclSuccess);
@@ -368,6 +398,7 @@ impl daemon::AtomicHistogram<EventStep> for Connection {
         let ts = step.start_time + self.gpuviz.epoch_dt;
         let latency = match self.conn_type {
             ConnectionType::Net => step.dur_ns as _,
+            ConnectionType::Cts => step.fifo_wait_dur_ns.unwrap_or(0) as _,
             ConnectionType::E2e => (step.dur_ns + step.fifo_wait_dur_ns.unwrap_or(0)) as _,
         };
         let _ = self.notify_latency(ts, latency, step.size, self.is_send);
@@ -378,6 +409,7 @@ impl daemon::AtomicHistogram<EventStep> for Connection {
 pub enum ConnectionType {
     Net,
     E2e,
+    Cts,
 }
 
 #[derive(Debug)]
@@ -444,6 +476,7 @@ impl<C: AsRef<Connection> + From<Connection>> HistogramManager<C> {
                 conn.remote_or_root_rank = *peer as _;
                 conn.collective_type = match key.1 {
                     ConnectionType::Net => c"net_send.network_send_latency".as_ptr(),
+                    ConnectionType::Cts => c"net_send.fifo_wait_time".as_ptr(),
                     ConnectionType::E2e => c"net_send.issue_to_completion".as_ptr(),
                 };
             }
@@ -499,8 +532,8 @@ impl<C: AsRef<Connection> + From<Connection>> HistogramManager<C> {
     }
 
     pub fn send_heartbeat(&mut self, event: pb::ntc::Event) {
-        // this is blocked behind TELEMETRY_UPLOAD flag, but still make sure v2 is loaded
-        if matches!(self.gpuviz.api, GpuvVizApi::V1(_)) || self.connections.is_empty() {
+        // this is blocked behind HEARTBEAT flag, but still make sure v2 is loaded
+        if matches!(self.gpuviz.api, GpuVizApi::V1(_)) || self.connections.is_empty() {
             return;
         }
         // any connection works, take the first one

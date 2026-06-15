@@ -58,7 +58,11 @@ fn cmake_build(dir: &str, lib_name: &str, def_vars: &[(&str, &str)]) {
 }
 
 fn main() {
-    let profiler_hdr_dir = "third_party/nccl/ext-profiler/example/nccl";
+    let mut profiler_hdr_dir = "third_party/nccl/ext-profiler/example/nccl";
+    // starting with NCCL 2.30, the ext-profiler is at a new path
+    if !std::path::Path::new(profiler_hdr_dir).exists() {
+        profiler_hdr_dir = "third_party/nccl/plugins/profiler/example/nccl";
+    }
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     write_binding(

@@ -21,6 +21,7 @@ use crate::event_ffi;
 use crate::event_ffi::AsFFI as _;
 use crate::gpuviz;
 use crate::nccl_metadata;
+use crate::nccl_metadata::ProxyOp;
 use crate::nccl_metadata::{Coll as _, Event as _, NcclOp as _, P2p as _, ProxyStep as _};
 use crate::profiler_shim;
 use crate::slab;
@@ -33,8 +34,8 @@ use rand::{rngs::SmallRng, RngCore as _, SeedableRng as _};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc; //copybara:strip(unused_dep)
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
@@ -60,6 +61,7 @@ pub struct Profiler {
     daemon: Mutex<Option<cloud_daemon::CloudDaemon>>,
 
     ncclop_cnt: AtomicU64,
+    pub remote_net_bytes: Option<Arc<AtomicUsize>>,
     pub free_ncclop: slab::AtomicFreeList<event::NcclOp>,
     pub free_proxyop: slab::AtomicFreeList<event::ProxyOp>,
     pub free_step_batch: slab::AtomicFreeList<daemon::StepBatch>,
@@ -100,6 +102,11 @@ impl Profiler {
             daemon: Mutex::new(None),
 
             ncclop_cnt: AtomicU64::new(0),
+            remote_net_bytes: if config.heartbeat_collective_progress {
+                Some(Arc::new(AtomicUsize::new(0)))
+            } else {
+                None
+            },
             free_ncclop: slab::AtomicFreeList::default(),
             free_proxyop: slab::AtomicFreeList::default(),
             free_step_batch: slab::AtomicFreeList::default(),
@@ -319,14 +326,18 @@ impl ThreadLocalState<'_> {
 }
 
 /// struct that holds states for communicator
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Communicator {
-    comm_hash: Option<u64>,
+    pub comm_hash: Option<u64>,
+    pub total_net_bytes: Arc<AtomicUsize>,
 }
 
 impl Communicator {
-    fn new() -> Self {
-        Self { comm_hash: None }
+    pub fn new() -> Self {
+        Self {
+            comm_hash: None,
+            total_net_bytes: Arc::new(AtomicUsize::new(0)),
+        }
     }
 }
 
@@ -349,11 +360,17 @@ pub struct ProxyOpLocalData {
 }
 
 impl ProxyOpLocalData {
-    pub fn new<E>(id: u32, descr: &E, is_v1: bool, track_fifo_wait: bool) -> Self
+    pub fn new<E>(
+        id: u32,
+        descr: &E,
+        is_v1: bool,
+        track_fifo_wait: bool,
+        comm: Option<Communicator>,
+    ) -> Self
     where
         E: nccl_metadata::ProxyOp,
     {
-        let info = event::ProxyOpInfo::from_descr(descr, id);
+        let info = event::ProxyOpInfo::from_descr(descr, id, comm);
         let is_send = info.is_send;
         Self {
             info,
@@ -460,6 +477,11 @@ pub fn init_handler_v4(
     *e_activation_mask = mask as i32;
     let mut comm = Box::new(Communicator::new());
     comm.comm_hash = Some(comm_hash);
+    if config::CONFIG.heartbeat_collective_progress {
+        with_thread_state(|thread_state| {
+            thread_state.send_to_daemon(daemon::Message::CommOpen(*comm.clone()), true)
+        });
+    }
     Ok(comm)
 }
 
@@ -605,6 +627,7 @@ where
             let descr = unsafe { descr.cast_to_proxyop() };
             let parent_ffi = descr.parent_obj();
             let parent_type = event_ffi::get_handle_type(parent_ffi);
+
             if parent_ffi.is_null() {
                 None
             } else if parent_type == event_ffi::Type::SmallNcclOp {
@@ -614,12 +637,19 @@ where
                 with_thread_state(|thread_state| {
                     let profiler = thread_state.profiler;
                     let proxyop_id = thread_state.next_proxyop_id();
-
+                    let comm: Option<Communicator> =
+                        // SAFETY: comm is valid when pids match
+                        if config.heartbeat_collective_progress && profiler.pid == descr.pid() {
+                            unsafe { Some((*comm).clone()) }
+                        } else {
+                            None
+                        };
                     let mut local_data = ProxyOpLocalData::new(
                         proxyop_id,
                         descr,
                         E::version() == Version::V1,
                         profiler.config.track_step_fifo_wait,
+                        comm,
                     );
                     let is_send = local_data.info.is_send;
                     let mut skip_step_tracking = parent_type == event_ffi::Type::NcclOpLite;
@@ -852,6 +882,17 @@ where
                     data.start_time = Some(now);
                 }
                 data.size = e_state_args.trans_size();
+                if let Some(ref remote_net_bytes) = thread_state.profiler.remote_net_bytes {
+                    // SAFETY: NCCL guarantees that the proxyop event handle is
+                    // live at this moment and the proxystep is on the same thread
+                    // as the parent event handle.
+                    let parent = unsafe { &*data.parent };
+                    if let Some(ref comm) = parent.info.comm {
+                        comm.total_net_bytes.fetch_add(data.size, Ordering::Release);
+                    } else {
+                        remote_net_bytes.fetch_add(data.size, Ordering::Release);
+                    }
+                }
             }
             profiler_shim::proxy_event_state::v4::RECV_WAIT => {
                 data.start_time = Some(thread_state.profiler.recent_timer_instant());

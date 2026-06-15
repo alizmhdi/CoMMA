@@ -15,14 +15,14 @@
 use crate::event;
 use crate::event::ProfilerEvent as _;
 use crate::fixed_batch;
+use crate::nccl_metadata;
 use crate::profiler;
+use crate::profiler::Communicator;
 use crate::profiler::Profiler;
 use crate::shm_fifo;
 use crate::slab;
 use crate::spsc;
 use crate::step_tracker::EventStep;
-
-use crate::gpuviz;
 
 use log::error;
 
@@ -39,6 +39,12 @@ const RETRY_MS: u64 = 100;
 
 pub trait Export {
     fn export(&self, ctx: &mut PollingContext, maybe_retry_ms: Option<u64>);
+    fn get_latency_histogram(
+        &self,
+        _key: &nccl_metadata::NcclOpKey,
+    ) -> Option<impl std::iter::IntoIterator<Item = Arc<dyn AtomicHistogram<EventStep>>>> {
+        None::<Vec<_>>
+    }
 }
 
 pub trait AtomicHistogram<T>: std::fmt::Debug + Sync + Send {
@@ -135,6 +141,7 @@ pub enum Message {
         /* duration ns */ u64,
         /* parent handle */ usize,
     ),
+    CommOpen(Communicator),
     CommClose(/* comm_hash = */ u64),
 }
 
@@ -164,6 +171,7 @@ pub enum Telemetry {
     NcclOpIssued(Box<event::NcclOp>), // copybara:strip(hang detection)
     NcclOp(Box<event::NcclOp>),
     ProxyOp(Box<event::ProxyOp>),
+    CommOpen(Communicator),
     CommClose(/* comm_hash = */ u64),
 }
 
@@ -179,8 +187,6 @@ pub struct PollingContext<'a> {
 
     peer_rank_fifo: HashMap<libc::pid_t, shm_fifo::mpsc::Sender<InterProcessMessage>>,
     pending_ipc_msg: HashMap<libc::pid_t, VecDeque<InterProcessMessage>>,
-
-    gpuviz: Option<gpuviz::HistogramManager<Arc<gpuviz::Connection>>>, // copybara:strip(gpuviz)
 }
 
 impl<'a> PollingContext<'a> {
@@ -195,12 +201,6 @@ impl<'a> PollingContext<'a> {
             free_step_batch: slab::FreeList::default(),
             peer_rank_fifo: HashMap::new(),
             pending_ipc_msg: HashMap::new(),
-            // copybara:strip_begin(gpuviz)
-            gpuviz: profiler
-                .gpuviz_lib
-                .as_ref()
-                .map(|lib| gpuviz::HistogramManager::new(lib.clone())),
-            // copybara:strip_end
         }
     }
 
@@ -247,12 +247,16 @@ impl<'a> PollingContext<'a> {
     }
 
     // copybara:strip_begin(gpuviz)
-    fn try_add_histogram(
+    fn try_add_histogram<E>(
         &mut self,
         thread_state: &mut ThreadState,
+        exporter: &mut E,
         ncclop_id: usize,
         proxyop_id: u32,
-    ) -> Option<()> {
+    ) -> Option<()>
+    where
+        E: Export,
+    {
         let ncclop = self.get_ncclop(ncclop_id)?;
         let op_key = ncclop.op_key();
         let comm_hash = op_key.get_comm_hash();
@@ -276,49 +280,55 @@ impl<'a> PollingContext<'a> {
                 }
             }
         }
-        self.try_add_histogram_from_comm_hash(thread_state, proxyop_id, comm_hash)
+        self.try_add_histogram_from_comm_hash(thread_state, exporter, proxyop_id, comm_hash)
     }
 
-    fn try_add_histogram_from_comm_hash(
+    fn try_add_histogram_from_comm_hash<E>(
         &mut self,
         thread_state: &mut ThreadState,
+        exporter: &mut E,
         proxyop_id: u32,
         comm_hash: u64,
-    ) -> Option<()> {
-        let proxyop = thread_state.proxyops.get_mut(&proxyop_id)?;
+    ) -> Option<()>
+    where
+        E: Export,
+    {
+        let proxyop = if let Some(p) = thread_state.proxyops.get_mut(&proxyop_id) {
+            p
+        } else {
+            &mut thread_state
+                .pending_comm_hash_proxyops
+                .get_mut(&proxyop_id)?
+                .0
+        };
         if proxyop.has_step_histograms() {
             return None;
         }
-        let gpuviz = self.gpuviz.as_mut()?;
         let conn_key = proxyop.info().op_key(comm_hash);
-        let mut histograms: Vec<Arc<dyn AtomicHistogram<EventStep>>> = Vec::new();
-        if self.profiler.config.track_step_fifo_wait {
-            histograms.push(
-                gpuviz
-                    .get_connection(&conn_key, Some(gpuviz::ConnectionType::Net))
-                    .cloned()
-                    .ok()?,
-            );
-            histograms.push(
-                gpuviz
-                    .get_connection(&conn_key, Some(gpuviz::ConnectionType::E2e))
-                    .cloned()
-                    .ok()?,
-            );
-        } else {
-            histograms.push(gpuviz.get_connection(&conn_key, None).cloned().ok()?);
-        };
-        proxyop.set_step_histograms(histograms);
+        if let Some(h_list) = exporter.get_latency_histogram(&conn_key) {
+            proxyop.set_step_histograms(h_list.into_iter().map(|h| h as _).collect());
+        }
         Some(())
     }
     // copybara:strip_end
 
-    fn add_proxyop(
+    fn should_wait_for_comm_hash(&self, proxyop: &event::ProxyOp) -> bool {
+        self.profiler.config.track_interprocess_proxyop
+            && proxyop.aggregate_steps()
+            && proxyop.info().pid != self.profiler.pid
+            && proxyop.info().parent().is_some()
+            && !proxyop.has_step_histograms()
+    }
+
+    fn add_proxyop<E>(
         &mut self,
         thread_state: &mut ThreadState,
+        exporter: &mut E,
         info: &event::ProxyOpInfo,
         start_time: Instant,
-    ) {
+    ) where
+        E: Export,
+    {
         let id = info.id;
         let mut op = Box::new(event::ProxyOp::from_info(info, start_time));
         let mut aggregate_steps = false;
@@ -339,7 +349,7 @@ impl<'a> PollingContext<'a> {
         // copybara:strip_begin(gpuviz)
         if let Some(parent) = info.parent() {
             if aggregate_steps && info.pid == self.profiler.pid {
-                self.try_add_histogram(thread_state, parent, id);
+                self.try_add_histogram(thread_state, exporter, parent, id);
             }
         }
         // copybara:strip_end
@@ -376,6 +386,7 @@ impl<'a> PollingContext<'a> {
         end_time: Instant,
         info: &event::ProxyOpInfo,
         proxyops: Vec<Box<event::ProxyOp>>,
+        send_ipc: bool,
     ) {
         let config = &self.profiler.config;
         let record_proxyop = config.track_proxyop || config.track_steps;
@@ -390,7 +401,7 @@ impl<'a> PollingContext<'a> {
                     }
                 }
                 return;
-            } else {
+            } else if send_ipc {
                 let msg = InterProcessMessage::ProxyOpEnd(parent_handle, end_time);
                 self.append_ipc_message(info.pid, msg);
             }
@@ -402,10 +413,23 @@ impl<'a> PollingContext<'a> {
         }
     }
 
+    fn finalize_pending_comm_hash_proxyop(&mut self, proxyop: Box<event::ProxyOp>) {
+        let info = proxyop.info().clone();
+        let end_time = proxyop.basic_info().end_time().unwrap_or_else(Instant::now);
+        self.handle_proxyop_end(end_time, &info, vec![proxyop], false);
+    }
+
     /// Construct a Telemetry type from Message.
     /// Resource used by `msg` should be release ASAP so the profiler API handlers won't be blocked on
     /// them
-    fn handle_fifo_message(&mut self, msg: Message, thread_state: &mut ThreadState) {
+    fn handle_fifo_message<E>(
+        &mut self,
+        msg: Message,
+        thread_state: &mut ThreadState,
+        exporter: &mut E,
+    ) where
+        E: Export,
+    {
         match msg {
             Message::Group(group) => {
                 if self.profiler.config.track_group {
@@ -427,7 +451,7 @@ impl<'a> PollingContext<'a> {
             Message::ProxyOpLite(start_time, dur_ns, info) => {
                 self.handle_proxyop_start(thread_state, &info, start_time);
                 let end_time = start_time + Duration::from_nanos(dur_ns);
-                self.handle_proxyop_end(end_time, &info, Vec::new());
+                self.handle_proxyop_end(end_time, &info, Vec::new(), true);
             }
             Message::ProxyOpExtra(extra) => {
                 thread_state.aux_msg.push(Message::ProxyOpExtra(extra));
@@ -450,8 +474,16 @@ impl<'a> PollingContext<'a> {
                     }
                     let info = proxyop.info().clone();
                     let end_time = proxyop.basic_info().end_time().unwrap_or_else(Instant::now);
-                    let ops = vec![proxyop];
-                    self.handle_proxyop_end(end_time, &info, ops);
+
+                    let mut ops = Vec::new();
+                    if self.should_wait_for_comm_hash(&proxyop) {
+                        thread_state
+                            .pending_comm_hash_proxyops
+                            .insert(id, (proxyop, Instant::now()));
+                    } else {
+                        ops.push(proxyop);
+                    }
+                    self.handle_proxyop_end(end_time, &info, ops, true);
                 } else {
                     // error!("proxyop {} not found!", id);
                 }
@@ -460,6 +492,7 @@ impl<'a> PollingContext<'a> {
                 if !thread_state.proxyops.contains_key(&info.id) {
                     self.add_proxyop(
                         thread_state,
+                        exporter,
                         &info,
                         self.profiler.init_instant + Duration::from_nanos(steps[0].start_time),
                     );
@@ -490,8 +523,16 @@ impl<'a> PollingContext<'a> {
                         proxyop.add_extra_info(extra);
                     }
                     let end_time = proxyop.basic_info().end_time().unwrap_or_else(Instant::now);
-                    let ops = vec![proxyop];
-                    self.handle_proxyop_end(end_time, &info, ops);
+
+                    let mut ops = Vec::new();
+                    if self.should_wait_for_comm_hash(&proxyop) {
+                        thread_state
+                            .pending_comm_hash_proxyops
+                            .insert(info.id, (proxyop, Instant::now()));
+                    } else {
+                        ops.push(proxyop);
+                    }
+                    self.handle_proxyop_end(end_time, &info, ops, true);
                 }
                 self.free_step_batch.free(steps);
                 if self.free_step_batch.num_free() >= slab::FREELIST_BATCH {
@@ -508,6 +549,9 @@ impl<'a> PollingContext<'a> {
                     );
                 }
             }
+            Message::CommOpen(comm) => {
+                self.pending_telemetry.push_back(Telemetry::CommOpen(comm));
+            }
             Message::CommClose(comm_hash) => {
                 self.pending_telemetry
                     .push_back(Telemetry::CommClose(comm_hash));
@@ -515,11 +559,19 @@ impl<'a> PollingContext<'a> {
         }
     }
 
-    /* copybara:strip_begin(unused_var) */
-    fn handle_ipc_message(&mut self, threads: &mut [ThreadControl], msg: InterProcessMessage) {
+    fn handle_ipc_message<E>(
+        &mut self,
+        /* copybara:strip_begin(gpuviz) */
+        threads: &mut [ThreadControl],
+        exporter: &mut E,
         /* copybara:strip_end_and_replace
-        fn handle_ipc_message(&mut self, _threads: &mut [ThreadControl], msg: InterProcessMessage) {
-        */
+        _threads: &mut [ThreadControl],
+        _exporter: &mut E,
+         */
+        msg: InterProcessMessage,
+    ) where
+        E: Export,
+    {
         match msg {
             InterProcessMessage::ProxyOpStart(handle, pid, thread_idx, id, time) => {
                 if let Some(ncclop) = self.get_ncclop(handle) {
@@ -538,7 +590,19 @@ impl<'a> PollingContext<'a> {
             InterProcessMessage::ReplyProxyOpComm(thread_idx, id, comm) => {
                 let t = &mut threads[thread_idx];
                 if self.profiler.config.aggregate_steps {
-                    let _ = self.try_add_histogram_from_comm_hash(&mut t.daemon_state, id, comm);
+                    let _ = self.try_add_histogram_from_comm_hash(
+                        &mut t.daemon_state,
+                        exporter,
+                        id,
+                        comm,
+                    );
+                    // If the proxyop has already ended and was waiting for this comm_hash,
+                    // finalize it now.
+                    if let Some((proxyop, _)) =
+                        t.daemon_state.pending_comm_hash_proxyops.remove(&id)
+                    {
+                        self.finalize_pending_comm_hash_proxyop(proxyop);
+                    }
                 }
             } /* copybara:strip_end_and_replace
               InterProcessMessage::ReplyProxyOpComm(_, _, _) => {}
@@ -585,6 +649,7 @@ pub struct ThreadControl {
 struct ThreadState {
     idx: usize,
     proxyops: HashMap<u32, Box<event::ProxyOp>>,
+    pending_comm_hash_proxyops: HashMap<u32, (Box<event::ProxyOp>, Instant)>,
     aux_msg: Vec<Message>,
 }
 
@@ -638,7 +703,7 @@ const IPC_RECV_BATCH: usize = 512;
 const IPC_SEND_BATCH: usize = 64;
 const NCCLOP_RECLAIM_BATCH: usize = 512;
 
-pub fn polling_loop<E>(ctx: &mut PollingContext, exporter: E)
+pub fn polling_loop<E>(ctx: &mut PollingContext, mut exporter: E)
 where
     E: Export,
 {
@@ -693,18 +758,18 @@ where
                 .ncclop_fifo
                 .recv_many(FIFO_FETCH_INTERVAL, FIFO_RECV_BATCH, n_recv > 0);
             thread.ncclop_fifo.process_many(FIFO_PROCESS_BATCH, |msg| {
-                ctx.handle_fifo_message(msg, &mut thread.daemon_state);
+                ctx.handle_fifo_message(msg, &mut thread.daemon_state, &mut exporter);
             });
         }
 
         for thread in threads.iter_mut() {
             thread.fifo.process_many(FIFO_PROCESS_BATCH, |msg| {
-                ctx.handle_fifo_message(msg, &mut thread.daemon_state);
+                ctx.handle_fifo_message(msg, &mut thread.daemon_state, &mut exporter);
             });
         }
 
         for msg in ipc_msg {
-            ctx.handle_ipc_message(&mut threads, msg);
+            ctx.handle_ipc_message(&mut threads, &mut exporter, msg);
         }
 
         let mut pending_ipc_msg = std::mem::take(&mut ctx.pending_ipc_msg);
@@ -729,6 +794,22 @@ where
         ctx.pending_ipc_msg = pending_ipc_msg;
 
         ctx.try_commit_ipc();
+
+        let comm_hash_ipc_timeout = ctx.profiler.config.comm_hash_ipc_timeout;
+        for thread in threads.iter_mut() {
+            thread.daemon_state.pending_comm_hash_proxyops =
+                std::mem::take(&mut thread.daemon_state.pending_comm_hash_proxyops)
+                    .into_iter()
+                    .flat_map(|(id, (proxyop, start_time))| {
+                        if start_time.elapsed() > comm_hash_ipc_timeout {
+                            ctx.finalize_pending_comm_hash_proxyop(proxyop);
+                            None
+                        } else {
+                            Some((id, (proxyop, start_time)))
+                        }
+                    })
+                    .collect();
+        }
 
         if ctx.free_proxyop.num_free() >= slab::FREELIST_BATCH {
             ctx.free_proxyop.try_publish(&ctx.profiler.free_proxyop);
@@ -768,15 +849,21 @@ where
             .ncclop_fifo
             .recv_many(FIFO_FETCH_INTERVAL, usize::MAX, true);
         thread.ncclop_fifo.process_many(usize::MAX, |msg| {
-            ctx.handle_fifo_message(msg, &mut thread.daemon_state);
+            ctx.handle_fifo_message(msg, &mut thread.daemon_state, &mut exporter);
         });
     }
 
     for thread in threads.iter_mut() {
         thread.fifo.recv_many(FIFO_FETCH_INTERVAL, usize::MAX, true);
         thread.fifo.process_many(usize::MAX, |msg| {
-            ctx.handle_fifo_message(msg, &mut thread.daemon_state);
+            ctx.handle_fifo_message(msg, &mut thread.daemon_state, &mut exporter);
         });
+    }
+
+    for thread in threads.iter_mut() {
+        for (_, (proxyop, _)) in thread.daemon_state.pending_comm_hash_proxyops.drain() {
+            ctx.finalize_pending_comm_hash_proxyop(proxyop);
+        }
     }
 
     ctx.reclaim_all_ncclops_in_map();

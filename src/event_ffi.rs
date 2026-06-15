@@ -306,6 +306,7 @@ mod tests {
             unsafe { proxyop_descr.cast_to_proxyop() },
             false,
             false,
+            Some(profiler::Communicator::new()),
         )));
         let handle = Event::into_ffi(event);
         // SAFETY: handle is valid return value of into_ffi()
