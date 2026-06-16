@@ -227,6 +227,40 @@ typedef struct {
                                       const uint8_t* event_data, size_t len);
 } ncclStatsPlugin_v2_t;
 
+typedef struct {
+  // Name of the statistics collector
+  const char* name;
+  // Initialize a statistics object, input is a bitmap of distribution type to
+  // collect, output is a handle to the created object
+  ncclResult_t (*init)(ncclDebugLogger_t logFunction,
+                       uint64_t distributionCollectorBitmap,
+                       ncclTelemetryMode defaultTelemetryMode,
+                       const char* callerIdentifier, int32_t major,
+                       int32_t minor, uintptr_t* statsGlobalHandle /* Out */);
+  // Destroy a statistics object. Implicitly destroys all connections created
+  // for the object to track
+  ncclResult_t (*destroy)(uintptr_t statsGlobalHandle);
+  // Notifies the statistics object about a new connection, output is a handle
+  // to the statistics tracking object for this connection.
+  ncclResult_t (*addConnection)(
+      uintptr_t statsGlobalHandle,
+      const ncclStatsConnectionIdentifier* connectionIdentifier,
+      uintptr_t* statsConnectionHandle /* Out */);
+  // Indicates that a connection was closed, with a reason description
+  ncclResult_t (*deleteConnection)(uintptr_t statsConnectionHandle,
+                                   ncclStatsConnectionCloseType closeType,
+                                   const char* verboseReason);
+  // Notifies the statistics object about a measurement of a transaction over a
+  // specific connection, must not be called from multiple threads for the same
+  // connection handle at the same time (caller responsible for synchronization)
+  ncclResult_t (*notifyOperationMeasurement)(
+      uintptr_t statsConnectionHandle,
+      const ncclStatsOperationMetric* measurement);
+  // Notifies about the Profiler Plugin event (serialized proto Event in bytes)
+  ncclResult_t (*notifyProfilerEvent)(uintptr_t statsConnectionHandle,
+                                      const uint8_t* event_data, size_t len);
+} ncclStatsPlugin_v3_t;
+
 typedef ncclStatsPlugin_v1_t ncclStatsPlugin_t;
 
 #ifdef __cplusplus

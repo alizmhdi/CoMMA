@@ -236,6 +236,8 @@ message ActiveCommunicator {
   map<string, uint64> coll_net_bytes = 4;
   map<uint32, uint64> issued_p2p_send_bytes = 5;
   map<uint32, uint64> issued_p2p_recv_bytes = 6;
+  map<string, uint64> coll_last_op_size = 7;
+  map<string, string> coll_last_algo = 8;
 };
 
 message ClosedCommunicator {
@@ -247,6 +249,7 @@ message ClosedCommunicator {
 message Heartbeat {
   repeated ActiveCommunicator active_comm = 1;
   repeated ClosedCommunicator closed_comm = 2;
+  optional uint64 remote_comm_bytes = 3;
 };
 
 message Event {
