@@ -32,9 +32,15 @@ Note that CoMMA integrates with GCP services to enable GCP-specific features. Wh
 You can view the raw data collected by exporting the CoMMA output to a local file. This could be done by setting the following environment varaibles:
 - NCCL_PROFILER_LATENCY_FILE=/tmp/latency-%p.txt
 
+For details on the JSON format, see [CoMMA JSON export format](docs/json-format.md).
+
+For a complete list of configuration options, see [CoMMA Configuration Options](docs/configuration.md).
+
 For detailed instructions on configuraing the granularity of telemetry export, see [AI Hypercomputer documentation](https://cloud.google.com/ai-hypercomputer/docs/nccl/comma).
 
-The output is a list JSON objects providing detailed information about communication operations. 
+### OpenTelemetry Support
+CoMMA supports exporting metrics and (experimentally) traces via OpenTelemetry. For details on how to configure and use OTel support, see [OpenTelemetry Support in CoMMA](docs/otel-support.md).
+
 
 ## Contributing
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to contribute to this project.
