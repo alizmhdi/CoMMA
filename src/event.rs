@@ -25,7 +25,7 @@ use crate::step_tracker::EventStep;
 use serde_json::json;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub enum Event {
@@ -34,6 +34,7 @@ pub enum Event {
     NcclOp(usize),
     ProxyOpLite(slab::AllocatedNode<profiler::ProxyOpLocalData>), // Lite == no step tracking
     KernelCh(slab::AllocatedNode<profiler::KernelCh>),
+    KernelStep(slab::AllocatedNode<profiler::KernelStepLocal>),
     ProxyOp(slab::AllocatedNode<profiler::ProxyOpLocalData>),
     Dummy(usize),
     SmallNcclOp(usize),
@@ -132,6 +133,19 @@ pub struct NcclOp {
     comm_hash: Option<u64>, // starting from v4 comm_hash is no longer part of the event descriptor
     descr: nccl_metadata::EventMetadata,
     proxyops: Option<Vec<ProxyOp>>,
+    kernel_steps: Option<Vec<KernelEventStep>>,
+}
+
+/// Per-slice Simple-prims KernelStep attached to a Coll/P2p NcclOp.
+#[derive(Debug, Clone)]
+pub struct KernelEventStep {
+    pub channel_id: u8,
+    pub is_send: bool,
+    pub peer: u8,
+    pub step: u32,
+    pub size: u32,
+    pub start_gpu_clk: u64,
+    pub stop_gpu_clk: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +279,7 @@ impl NcclOp {
             comm_hash: comm_hash_override,
             descr: descr.clone_to_metadata(),
             proxyops: None,
+            kernel_steps: None,
         }
     }
 
@@ -330,6 +345,41 @@ impl NcclOp {
         }
         self.proxyops.as_mut().unwrap().push(proxyop);
     }
+
+    pub fn add_kernel_step(&mut self, step: KernelEventStep) {
+        if self.kernel_steps.is_none() {
+            self.kernel_steps = Some(Vec::new());
+        }
+        self.kernel_steps.as_mut().unwrap().push(step);
+        self.refresh_timing_from_kernel_steps();
+    }
+
+    /// Set host end_time from the GPU globaltimer span of attached KernelSteps
+    /// so Coll/P2p are not left reclaimed with dur=0 on SHM/intra-host paths
+    /// that have no ProxyOp/KernelCh completion.
+    fn refresh_timing_from_kernel_steps(&mut self) {
+        let Some(steps) = self.kernel_steps.as_ref() else {
+            return;
+        };
+        if steps.is_empty() {
+            return;
+        }
+        let mut min_start = u64::MAX;
+        let mut max_stop = 0u64;
+        for s in steps {
+            min_start = min_start.min(s.start_gpu_clk);
+            max_stop = max_stop.max(s.stop_gpu_clk);
+        }
+        if min_start == u64::MAX || max_stop < min_start {
+            return;
+        }
+        let dur_ns = max_stop - min_start;
+        let st = self.basic_info.start_time();
+        // child_start ≈ enqueue; end = enqueue + GPU span (globaltimer is ns).
+        self.update_child_start_time(st);
+        self.basic_info
+            .update_end_time(st + Duration::from_nanos(dur_ns));
+    }
 }
 
 impl ProfilerEvent for NcclOp {
@@ -377,6 +427,24 @@ impl ProfilerEvent for NcclOp {
             json["proxyops"] = proxyops
                 .iter()
                 .map(|op| op.trace_record(&mut time_to_num))
+                .collect();
+        }
+
+        if let Some(steps) = self.kernel_steps.as_ref() {
+            json["kernel_steps"] = steps
+                .iter()
+                .map(|s| {
+                    json!({
+                        "channel": s.channel_id,
+                        "is_send": s.is_send,
+                        "peer": s.peer,
+                        "step": s.step,
+                        "size": s.size,
+                        "start_gpu_clk": s.start_gpu_clk,
+                        "stop_gpu_clk": s.stop_gpu_clk,
+                        "dur_gpu_clk": s.stop_gpu_clk.saturating_sub(s.start_gpu_clk),
+                    })
+                })
                 .collect();
         }
 
@@ -632,5 +700,49 @@ mod tests {
         basic_info.update_end_time(t1);
         basic_info.update_end_time(t0);
         assert_eq!(basic_info.end_time(), Some(t1));
+    }
+
+    #[test]
+    fn kernel_steps_set_parent_duration() {
+        let start = Instant::now();
+        let mut op = NcclOp {
+            basic_info: BasicInfo {
+                rank: 0,
+                start_time: start,
+                end_time: None,
+            },
+            id: 0,
+            is_p2p: false,
+            child_start_time: None,
+            comm_hash: Some(0x123),
+            descr: nccl_metadata::EventMetadata::V4(profiler_shim::EventDescrV4(unsafe {
+                std::mem::zeroed()
+            })),
+            proxyops: None,
+            kernel_steps: None,
+        };
+
+        op.add_kernel_step(KernelEventStep {
+            channel_id: 0,
+            is_send: true,
+            peer: 0,
+            step: 1,
+            size: 4,
+            start_gpu_clk: 1_000_000,
+            stop_gpu_clk: 1_000_000 + 5_000, // 5 us
+        });
+        op.add_kernel_step(KernelEventStep {
+            channel_id: 0,
+            is_send: false,
+            peer: 0,
+            step: 1,
+            size: 4,
+            start_gpu_clk: 1_000_000 + 1_000,
+            stop_gpu_clk: 1_000_000 + 12_000, // extends span to 12 us
+        });
+
+        let end = op.basic_info.end_time().expect("end_time set from kernel steps");
+        assert_eq!((end - start).as_nanos(), 12_000);
+        assert_eq!(op.child_start_time(), Some(start));
     }
 }

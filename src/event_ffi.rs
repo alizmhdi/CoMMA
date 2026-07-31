@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::event::{Event, Group, ProxyStep};
-use crate::profiler::{KernelCh, ProxyOpLocalData};
+use crate::profiler::{KernelCh, KernelStepLocal, ProxyOpLocalData};
 use crate::slab;
 
 use static_assertions::const_assert;
@@ -34,6 +34,7 @@ pub enum Type {
     SmallNcclOp,
     ProxyStep,
     KernelCh,
+    KernelStep,
 }
 
 impl Type {
@@ -48,6 +49,7 @@ impl Type {
             Type::SmallNcclOp => 0b110,
             Type::ProxyStep => 0b111,
             Type::KernelCh => 0b1000,
+            Type::KernelStep => 0b1001,
         }
     }
 
@@ -62,6 +64,7 @@ impl Type {
             0b110 => Type::SmallNcclOp,
             0b111 => Type::ProxyStep,
             0b1000 => Type::KernelCh,
+            0b1001 => Type::KernelStep,
             _ => panic!("unknown bit pattern"),
         }
     }
@@ -97,6 +100,7 @@ pub trait AsFFI: Sized {
 const_assert!(std::mem::align_of::<Group>() >= (1 << N_TYPE_BITS));
 const_assert!(std::mem::align_of::<ProxyStep>() >= (1 << N_TYPE_BITS));
 const_assert!(std::mem::align_of::<KernelCh>() >= (1 << N_TYPE_BITS));
+const_assert!(std::mem::align_of::<KernelStepLocal>() >= (1 << N_TYPE_BITS));
 const_assert!(std::mem::align_of::<ProxyOpLocalData>() >= (1 << N_TYPE_BITS));
 
 impl AsFFI for Event {
@@ -125,6 +129,10 @@ impl AsFFI for Event {
             Event::KernelCh(op) => {
                 let ptr = slab::AllocatedNode::into_raw(op);
                 handle(ptr as _, Type::KernelCh)
+            }
+            Event::KernelStep(op) => {
+                let ptr = slab::AllocatedNode::into_raw(op);
+                handle(ptr as _, Type::KernelStep)
             }
             /*
             Event::ProxyOp(id) => {
@@ -185,6 +193,11 @@ impl AsFFI for Event {
                 let handle = get_handle_inner(handle) as _;
                 let proxyop = slab::AllocatedNode::from_raw(handle);
                 Some(Event::KernelCh(proxyop))
+            }
+            Type::KernelStep => {
+                let handle = get_handle_inner(handle) as _;
+                let step = slab::AllocatedNode::from_raw(handle);
+                Some(Event::KernelStep(step))
             }
             /*
             Type::ProxyOp => {

@@ -141,6 +141,7 @@ pub enum Message {
         /* duration ns */ u64,
         /* parent handle */ usize,
     ),
+    KernelStep(event::KernelEventStep, /* parent handle */ usize),
     CommOpen(Communicator),
     CommClose(/* comm_hash = */ u64),
 }
@@ -547,6 +548,11 @@ impl<'a> PollingContext<'a> {
                         start_time,
                         Some(start_time + Duration::from_nanos(duration)),
                     );
+                }
+            }
+            Message::KernelStep(step, parent) => {
+                if let Some(ncclop) = self.get_ncclop(parent) {
+                    ncclop.add_kernel_step(step);
                 }
             }
             Message::CommOpen(comm) => {

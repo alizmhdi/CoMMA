@@ -386,6 +386,16 @@ async fn exporter(
     let mut uploader_interval = tokio::time::interval(profiler.config.heartbeat_upload_interval);
     uploader_interval.tick().await;
 
+    // Periodic latency-file flush for online consumers (straggler monitor).
+    let mut latency_flush_interval =
+        if profiler.config.latency_flush_interval > Duration::from_secs(0) {
+            let mut i = tokio::time::interval(profiler.config.latency_flush_interval);
+            i.tick().await;
+            Some(i)
+        } else {
+            None
+        };
+
     let mut otel_metrics_grouping_interval = if profiler.config.otel_enable {
         let mut i =
             tokio::time::interval(profiler.config.otel_metrics_cardinality_grouping_interval);
@@ -451,6 +461,15 @@ async fn exporter(
                         }
                     },
                     None => break,
+                }
+            },
+            _ = async { latency_flush_interval.as_mut().unwrap().tick().await },
+                    if latency_flush_interval.is_some() && latency_file.is_some() => {
+                if let Some(file) = latency_file.as_mut() {
+                    if let Err(e) = file.flush().await {
+                        error!("Failed to flush latency telemetry file: {}. Stop logging.", e);
+                        latency_file = None;
+                    }
                 }
             },
             _ = summary_interval.tick(), if summary.is_some() => {

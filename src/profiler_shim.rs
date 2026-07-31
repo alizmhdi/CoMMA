@@ -67,6 +67,17 @@ impl AsRef<ncclProfilerEventDescr_v4_t> for EventDescrV4 {
     }
 }
 
+#[repr(transparent)]
+#[derive(Debug, Clone)]
+pub struct EventDescrV6(pub ncclProfilerEventDescr_v6_t);
+
+impl AsRef<ncclProfilerEventDescr_v6_t> for EventDescrV6 {
+    #[inline(always)]
+    fn as_ref(&self) -> &ncclProfilerEventDescr_v6_t {
+        &self.0
+    }
+}
+
 pub type EventDescr = EventDescrV2;
 
 // alias of `ncclProfilerEventState_vX_t` to make the name shorter
@@ -111,6 +122,12 @@ pub mod proxy_event_state {
         pub const RECV_WAIT: u32 = ncclProfilerEventState_t_ncclProfilerProxyStepRecvWait;
         pub const RECV_FLUSH_WAIT: u32 =
             ncclProfilerEventState_t_ncclProfilerProxyStepRecvFlushWait;
+    }
+
+    pub mod v6 {
+        use super::*;
+        pub const KERNEL_STEP_STOP: u32 =
+            ncclProfilerEventState_t_ncclProfilerKernelStepStop;
     }
 }
 
