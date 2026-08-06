@@ -1,3 +1,4 @@
 [submodule "third_party/nccl"]
 	path = third_party/nccl
-	url = git@github.com:alizmhdi/nccl.git
+	url = https://github.com/alizmhdi/nccl.git
+	branch = kernelstep-profiler
