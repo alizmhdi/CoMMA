@@ -26,6 +26,8 @@ mod nccl_metadata;
 mod otel_utils; // copybara:strip(otel)
 mod profiler;
 pub mod profiler_shim;
+mod runtime_gates;
+mod control_rpc;
 mod shm_fifo;
 mod slab;
 mod spsc;

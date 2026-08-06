@@ -24,6 +24,7 @@ use crate::nccl_metadata;
 use crate::nccl_metadata::ProxyOp;
 use crate::nccl_metadata::{Coll as _, Event as _, KernelStep as _, NcclOp as _, P2p as _, ProxyStep as _};
 use crate::profiler_shim;
+use crate::runtime_gates::RuntimeGates;
 use crate::slab;
 use crate::spsc;
 use crate::step_tracker::StepTracker;
@@ -59,6 +60,8 @@ pub struct Profiler {
     pub init_instant: Instant,
     pub gpuviz_lib: Option<Arc<gpuviz::GpuViz>>, // copybara:strip(gpuviz)
     pub ctrl_fifo: ArrayQueue<daemon::ControlMessage>,
+    /// Runtime start-gate + dynamic NCCL activation mask.
+    pub gates: RuntimeGates,
     daemon: Mutex<Option<cloud_daemon::CloudDaemon>>,
 
     ncclop_cnt: AtomicU64,
@@ -100,6 +103,7 @@ impl Profiler {
             },
             // copybara:strip_end
             ctrl_fifo: ArrayQueue::new(CTRL_FIFO_SZ),
+            gates: RuntimeGates::new(config, version),
             daemon: Mutex::new(None),
 
             ncclop_cnt: AtomicU64::new(0),
@@ -145,6 +149,7 @@ impl Profiler {
         let mut lg = self.daemon.lock().unwrap();
         let daemon = daemon::Daemon::new(self);
         *lg = Some(daemon);
+        crate::control_rpc::spawn_control_server(self);
     }
 
     pub fn join_daemon(&'static self) {
@@ -478,25 +483,14 @@ pub fn init_handler_v4(
         }
         *lg += 1;
 
-        mask |= profiler_shim::ncclProfileGroup;
-        mask |= profiler_shim::ncclProfileColl;
-        mask |= profiler_shim::ncclProfileP2p;
-        mask |= profiler_shim::ncclProfileProxyOp;
-
-        if config::CONFIG.track_kernel_ch {
-            mask |= profiler_shim::ncclProfileKernelCh;
-        }
-
-        // KernelStep requires profiler API v6; older adapters strip the bit.
-        if config::CONFIG.track_kernel_step && matches!(version, Version::V6) {
-            mask |= profiler_shim::ncclProfileKernelStep;
-        }
-
-        if config::CONFIG.track_steps | config::CONFIG.aggregate_steps {
-            mask |= profiler_shim::ncclProfileProxyStep;
-        }
+        let profiler = PROFILER.get().unwrap();
+        // Retain NCCL's process-global mask pointer so the daemon can rewrite it.
+        profiler
+            .gates
+            .register_mask_ptr(e_activation_mask as *mut i32);
+        mask = profiler.gates.publish_mask();
     }
-    *e_activation_mask = mask as i32;
+    *e_activation_mask = mask;
     let mut comm = Box::new(Communicator::new());
     comm.comm_hash = Some(comm_hash);
     if config::CONFIG.heartbeat_collective_progress {
@@ -534,11 +528,15 @@ where
     E: nccl_metadata::Version + nccl_metadata::Event,
 {
     let config: &config::Config = &config::CONFIG;
+    let gates = PROFILER.get().map(|p| &p.gates);
     let event = match descr.type_() as u32 {
         profiler_shim::ncclProfileGroup => {
-            if config.track_ncclop {
+            let track_ncclop = gates.map(|g| g.track_ncclop()).unwrap_or(config.track_ncclop);
+            let track_group = gates.map(|g| g.track_group()).unwrap_or(config.track_group);
+            let track_proxyop = gates.map(|g| g.track_proxyop()).unwrap_or(config.track_proxyop);
+            if track_ncclop || track_group {
                 Some(event::Event::new_group(descr, Instant::now()))
-            } else if config.track_proxyop {
+            } else if track_proxyop {
                 Some(event::Event::new_dummyop(42))
             } else {
                 None
@@ -551,11 +549,17 @@ where
             let comm = unsafe { &*comm };
             let byte_count = descr.byte_count();
             let op_type = descr.op_type();
-            if config.track_ncclop {
+            let track_ncclop = gates.map(|g| g.track_ncclop()).unwrap_or(config.track_ncclop);
+            let track_proxyop = gates.map(|g| g.track_proxyop()).unwrap_or(config.track_proxyop);
+            if track_ncclop {
                 use nccl_metadata::NcclOpType;
-                let skip_step_tracking = !(config.track_steps
-                    || config.aggregate_steps
-                    || config.track_kernel_step);
+                let track_steps = gates
+                    .map(|g| g.proxy_step_enabled())
+                    .unwrap_or(config.track_steps || config.aggregate_steps);
+                let track_kernel_step = gates
+                    .map(|g| g.track_kernel_step())
+                    .unwrap_or(config.track_kernel_step);
+                let skip_step_tracking = !(track_steps || track_kernel_step);
                 let skip_small_msg =
                     config.skip_small_collective || config.skip_small_collective_steps;
                 if skip_small_msg
@@ -608,7 +612,7 @@ where
                             .unwrap_or_else(|| event::Event::new_dummyop(42))
                     }))
                 }
-            } else if config.track_proxyop {
+            } else if track_proxyop {
                 let comm_hash = comm
                     .comm_hash
                     .unwrap_or_else(|| descr.comm_hash().unwrap_or(42));
@@ -635,7 +639,9 @@ where
             });
 
             if should_sample {
-                if config.track_ncclop {
+                let track_ncclop = gates.map(|g| g.track_ncclop()).unwrap_or(config.track_ncclop);
+                let track_proxyop = gates.map(|g| g.track_proxyop()).unwrap_or(config.track_proxyop);
+                if track_ncclop {
                     let byte_count = descr.byte_count();
                     if byte_count > config.small_msg_threshold {
                         with_thread_state(|thread_state| {
@@ -653,7 +659,7 @@ where
                     } else {
                         None
                     }
-                } else if config.track_proxyop {
+                } else if track_proxyop {
                     let comm_hash = comm
                         .comm_hash
                         .unwrap_or_else(|| descr.comm_hash().unwrap_or(42));
@@ -680,6 +686,12 @@ where
                 with_thread_state(|thread_state| {
                     let profiler = thread_state.profiler;
                     let proxyop_id = thread_state.next_proxyop_id();
+                    let track_fifo = gates
+                        .map(|g| g.track_step_fifo_wait())
+                        .unwrap_or(profiler.config.track_step_fifo_wait);
+                    let track_recv = gates
+                        .map(|g| g.track_recv_steps())
+                        .unwrap_or(profiler.config.track_recv_steps);
                     let comm: Option<Communicator> =
                         // SAFETY: comm is valid when pids match
                         if config.heartbeat_collective_progress && profiler.pid == descr.pid() {
@@ -691,13 +703,13 @@ where
                         proxyop_id,
                         descr,
                         E::version() == Version::V1,
-                        profiler.config.track_step_fifo_wait,
+                        track_fifo,
                         comm,
                     );
                     let is_send = local_data.info.is_send;
                     let mut skip_step_tracking = parent_type == event_ffi::Type::NcclOpLite;
 
-                    if !skip_step_tracking && !is_send && !profiler.config.track_recv_steps {
+                    if !skip_step_tracking && !is_send && !track_recv {
                         skip_step_tracking = true;
                     }
 
@@ -725,6 +737,12 @@ where
             }
         }
         profiler_shim::ncclProfileKernelCh => {
+            let allow_ch = gates
+                .map(|g| g.track_kernel_ch())
+                .unwrap_or(config.track_kernel_ch);
+            if !allow_ch {
+                None
+            } else {
             let parent_ffi = descr.parent_obj();
             let parent_type = event_ffi::get_handle_type(parent_ffi);
             if parent_ffi.is_null() || parent_type == event_ffi::Type::SmallNcclOp {
@@ -750,8 +768,17 @@ where
                     None
                 }
             }
+            }
         }
         profiler_shim::ncclProfileProxyStep => {
+            // Start-gate: refuse NEW ProxyStep events when steps are disabled.
+            // In-flight ProxySteps still receive state/stop via their existing handles.
+            let allow_steps = gates
+                .map(|g| g.proxy_step_enabled())
+                .unwrap_or_else(|| config.track_steps || config.aggregate_steps);
+            if !allow_steps {
+                None
+            } else {
             // SAFETY: just checked that event type is proxystep
             let descr = unsafe { descr.cast_to_proxystep() };
             let parent_ffi = descr.parent_obj();
@@ -782,9 +809,13 @@ where
                     None
                 }
             }
+            }
         }
         profiler_shim::ncclProfileKernelStep => {
-            if !config.track_kernel_step || E::version() != Version::V6 {
+            let allow_ks = gates
+                .map(|g| g.track_kernel_step())
+                .unwrap_or(config.track_kernel_step);
+            if !allow_ks || E::version() != Version::V6 {
                 None
             } else {
                 let descr = unsafe { descr.cast_to_kernelstep() };

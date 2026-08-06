@@ -73,6 +73,9 @@ pub struct Config {
     pub aggregate_steps: bool,
     pub track_kernel_ch: bool,
     pub track_kernel_step: bool,
+    /// Unix socket path template for mid-flight gate RPC (`%p` = pid).
+    /// Default derived from `latency_file` dir as `control-%p.sock`.
+    pub control_sock: Option<String>,
     pub ncclop_completion_delay: Duration,
     pub comm_hash_ipc_timeout: Duration,
 
@@ -126,9 +129,11 @@ impl Config {
         field_from_env!(s, track_steps, false);
         field_from_env!(s, track_recv_steps, false);
         field_from_env!(s, track_step_fifo_wait, true);
-        field_from_env!(s, aggregate_steps, true);
-        field_from_env!(s, track_kernel_ch, false);
-        field_from_env!(s, track_kernel_step, true);
+        // Coarse default: Coll/P2P start+end only (no ProxyStep / KernelStep).
+        field_from_env!(s, aggregate_steps, false);
+        field_from_env!(s, track_kernel_ch, true);
+        field_from_env!(s, track_kernel_step, false);
+        field_from_env!(s, control_sock);
         field_from_env!(s, ncclop_completion_delay, Duration::from_secs(2));
         field_from_env!(s, comm_hash_ipc_timeout, Duration::from_secs(1));
 

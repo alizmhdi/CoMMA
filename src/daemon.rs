@@ -118,6 +118,8 @@ impl<T> FifoReceiver<T> {
 #[derive(Debug)]
 pub enum ControlMessage {
     NewThread(ThreadControl),
+    /// Apply runtime gate update (also used by tests / future IPC).
+    SetGates(crate::runtime_gates::GateUpdate),
 }
 
 #[derive(Debug)]
@@ -736,6 +738,9 @@ where
                 ControlMessage::NewThread(mut ctrl) => {
                     ctrl.daemon_state.idx = threads.len();
                     threads.push(ctrl);
+                }
+                ControlMessage::SetGates(update) => {
+                    let _ = ctx.profiler.gates.apply_update(&update);
                 }
             }
         }
