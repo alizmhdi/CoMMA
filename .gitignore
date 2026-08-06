@@ -1,0 +1,18 @@
+# Rust build
+/target/
+Cargo.lock
+
+# Built profiler plugin
+*.so
+libnccl-profiler.so
+
+# Local KernelStep / setup build stamps
+.kernelstep-*
+
+# Nested NCCL build tree
+third_party/nccl/build/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~

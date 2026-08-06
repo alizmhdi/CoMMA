@@ -747,7 +747,28 @@ pub trait KernelStep: Event {
     fn peer(&self) -> u8;
     fn step(&self) -> u32;
     fn size(&self) -> u32;
-    fn start_ptimer(&self) -> u64;
+    /// Wait/step begin (GPU globaltimer); 0 if none/recv.
+    fn start_ts(&self) -> u64;
+    /// Transfer/comm begin (GPU globaltimer).
+    fn ready_ts(&self) -> u64;
+    /// CoMMA ProxyStep-style wait: `ready_ts - start_ts` when `start_ts != 0`.
+    fn fifo_wait_dur_ns(&self) -> u32 {
+        derive_fifo_wait_dur_ns(self.start_ts(), self.ready_ts())
+    }
+}
+
+/// Derive ProxyStep-compatible `fifo_wait_dur_ns` from NCCL `startTs`/`readyTs`.
+#[inline(always)]
+pub fn derive_fifo_wait_dur_ns(start_ts: u64, ready_ts: u64) -> u32 {
+    if start_ts == 0 || ready_ts <= start_ts {
+        return 0;
+    }
+    let d = ready_ts - start_ts;
+    if d > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        d as u32
+    }
 }
 
 pub trait ProxyOpState {
@@ -1007,7 +1028,10 @@ macro_rules! def_kernelstep_unsupported {
             fn size(&self) -> u32 {
                 panic!("KernelStep unsupported on this profiler API version")
             }
-            fn start_ptimer(&self) -> u64 {
+            fn start_ts(&self) -> u64 {
+                panic!("KernelStep unsupported on this profiler API version")
+            }
+            fn ready_ts(&self) -> u64 {
                 panic!("KernelStep unsupported on this profiler API version")
             }
         }
@@ -1046,9 +1070,14 @@ macro_rules! def_kernelstep {
                 s.size
             }
             #[inline(always)]
-            fn start_ptimer(&self) -> u64 {
+            fn start_ts(&self) -> u64 {
                 let s = unsafe { &self.0 .0.__bindgen_anon_1.kernelStep };
-                s.pTimer
+                s.startTs
+            }
+            #[inline(always)]
+            fn ready_ts(&self) -> u64 {
+                let s = unsafe { &self.0 .0.__bindgen_anon_1.kernelStep };
+                s.readyTs
             }
         }
     };
@@ -1461,6 +1490,18 @@ impl ProxyStepState for ProxyStepStateV6 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_fifo_wait_from_timestamps() {
+        assert_eq!(derive_fifo_wait_dur_ns(0, 1_000_000), 0);
+        assert_eq!(derive_fifo_wait_dur_ns(1_000_000, 1_000_000), 0);
+        assert_eq!(derive_fifo_wait_dur_ns(1_000_000, 999_999), 0);
+        assert_eq!(derive_fifo_wait_dur_ns(1_000_000, 1_002_000), 2_000);
+        assert_eq!(
+            derive_fifo_wait_dur_ns(1, 1 + (u32::MAX as u64) + 10),
+            u32::MAX
+        );
+    }
 
     #[test]
     fn to_json_lossless() {

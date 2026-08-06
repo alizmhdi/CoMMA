@@ -134,6 +134,8 @@ pub struct NcclOp {
     descr: nccl_metadata::EventMetadata,
     proxyops: Option<Vec<ProxyOp>>,
     kernel_steps: Option<Vec<KernelEventStep>>,
+    kernel_step_min_start: Option<u64>,
+    kernel_step_max_stop: Option<u64>,
 }
 
 /// Per-slice Simple-prims KernelStep attached to a Coll/P2p NcclOp.
@@ -144,8 +146,12 @@ pub struct KernelEventStep {
     pub peer: u8,
     pub step: u32,
     pub size: u32,
-    pub start_gpu_clk: u64,
-    pub stop_gpu_clk: u64,
+    /// NCCL `startTs`: wait/step begin; 0 if none/recv.
+    pub start_ts: u64,
+    /// NCCL `readyTs`: transfer/comm begin.
+    pub ready_ts: u64,
+    /// Stop-ring end time (GPU globaltimer).
+    pub end_ts: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +286,8 @@ impl NcclOp {
             descr: descr.clone_to_metadata(),
             proxyops: None,
             kernel_steps: None,
+            kernel_step_min_start: None,
+            kernel_step_max_stop: None,
         }
     }
 
@@ -347,30 +355,34 @@ impl NcclOp {
     }
 
     pub fn add_kernel_step(&mut self, step: KernelEventStep) {
+        // Parent GPU span uses transfer begin (ready), excluding credit wait — like ProxyStep dur_ns.
+        let min_start = self
+            .kernel_step_min_start
+            .map_or(step.ready_ts, |start| start.min(step.ready_ts));
+        let max_stop = self
+            .kernel_step_max_stop
+            .map_or(step.end_ts, |stop| stop.max(step.end_ts));
+        self.kernel_step_min_start = Some(min_start);
+        self.kernel_step_max_stop = Some(max_stop);
+
         if self.kernel_steps.is_none() {
             self.kernel_steps = Some(Vec::new());
         }
         self.kernel_steps.as_mut().unwrap().push(step);
-        self.refresh_timing_from_kernel_steps();
+        self.refresh_timing_from_kernel_step_span();
     }
 
     /// Set host end_time from the GPU globaltimer span of attached KernelSteps
     /// so Coll/P2p are not left reclaimed with dur=0 on SHM/intra-host paths
     /// that have no ProxyOp/KernelCh completion.
-    fn refresh_timing_from_kernel_steps(&mut self) {
-        let Some(steps) = self.kernel_steps.as_ref() else {
+    fn refresh_timing_from_kernel_step_span(&mut self) {
+        let Some(min_start) = self.kernel_step_min_start else {
             return;
         };
-        if steps.is_empty() {
+        let Some(max_stop) = self.kernel_step_max_stop else {
             return;
-        }
-        let mut min_start = u64::MAX;
-        let mut max_stop = 0u64;
-        for s in steps {
-            min_start = min_start.min(s.start_gpu_clk);
-            max_stop = max_stop.max(s.stop_gpu_clk);
-        }
-        if min_start == u64::MAX || max_stop < min_start {
+        };
+        if max_stop < min_start {
             return;
         }
         let dur_ns = max_stop - min_start;
@@ -434,16 +446,25 @@ impl ProfilerEvent for NcclOp {
             json["kernel_steps"] = steps
                 .iter()
                 .map(|s| {
-                    json!({
+                    // Same JSON keys as ProxyStep: start_time → fifo_ready_time → end_time.
+                    let start_time = if s.start_ts != 0 {
+                        s.start_ts
+                    } else {
+                        s.ready_ts
+                    };
+                    let mut r = json!({
                         "channel": s.channel_id,
                         "is_send": s.is_send,
                         "peer": s.peer,
                         "step": s.step,
                         "size": s.size,
-                        "start_gpu_clk": s.start_gpu_clk,
-                        "stop_gpu_clk": s.stop_gpu_clk,
-                        "dur_gpu_clk": s.stop_gpu_clk.saturating_sub(s.start_gpu_clk),
-                    })
+                        "start_time": start_time,
+                        "end_time": s.end_ts,
+                    });
+                    if s.start_ts != 0 {
+                        r["fifo_ready_time"] = json!(s.ready_ts);
+                    }
+                    r
                 })
                 .collect();
         }
@@ -705,6 +726,8 @@ mod tests {
     #[test]
     fn kernel_steps_set_parent_duration() {
         let start = Instant::now();
+        let mut descr: profiler_shim::ncclProfilerEventDescr_v4_t = unsafe { std::mem::zeroed() };
+        descr.type_ = profiler_shim::ncclProfileColl as _;
         let mut op = NcclOp {
             basic_info: BasicInfo {
                 rank: 0,
@@ -715,11 +738,11 @@ mod tests {
             is_p2p: false,
             child_start_time: None,
             comm_hash: Some(0x123),
-            descr: nccl_metadata::EventMetadata::V4(profiler_shim::EventDescrV4(unsafe {
-                std::mem::zeroed()
-            })),
+            descr: nccl_metadata::EventMetadata::V4(profiler_shim::EventDescrV4(descr)),
             proxyops: None,
             kernel_steps: None,
+            kernel_step_min_start: None,
+            kernel_step_max_stop: None,
         };
 
         op.add_kernel_step(KernelEventStep {
@@ -728,8 +751,9 @@ mod tests {
             peer: 0,
             step: 1,
             size: 4,
-            start_gpu_clk: 1_000_000,
-            stop_gpu_clk: 1_000_000 + 5_000, // 5 us
+            start_ts: 1_000_000 - 2_000, // wait begin
+            ready_ts: 1_000_000,         // transfer begin
+            end_ts: 1_000_000 + 5_000,   // 5 us transfer
         });
         op.add_kernel_step(KernelEventStep {
             channel_id: 0,
@@ -737,12 +761,36 @@ mod tests {
             peer: 0,
             step: 1,
             size: 4,
-            start_gpu_clk: 1_000_000 + 1_000,
-            stop_gpu_clk: 1_000_000 + 12_000, // extends span to 12 us
+            start_ts: 0,
+            ready_ts: 1_000_000 + 1_000,
+            end_ts: 1_000_000 + 12_000, // extends span to 12 us
+        });
+        op.add_kernel_step(KernelEventStep {
+            channel_id: 1,
+            is_send: false,
+            peer: 0,
+            step: 0,
+            size: 4,
+            start_ts: 0,
+            ready_ts: 1_000_000 - 1_000, // moves the cached minimum earlier
+            end_ts: 1_000_000 + 1_000,
         });
 
-        let end = op.basic_info.end_time().expect("end_time set from kernel steps");
-        assert_eq!((end - start).as_nanos(), 12_000);
+        let end = op
+            .basic_info
+            .end_time()
+            .expect("end_time set from kernel steps");
+        // Parent uses transfer-only: min ready=999_000, max end=1_012_000 → 13_000 ns
+        assert_eq!((end - start).as_nanos(), 13_000);
         assert_eq!(op.child_start_time(), Some(start));
+
+        let rec = op.trace_record(|_| 0);
+        let ks = rec["kernel_steps"].as_array().expect("kernel_steps");
+        assert_eq!(ks[0]["start_time"], 1_000_000 - 2_000);
+        assert_eq!(ks[0]["fifo_ready_time"], 1_000_000);
+        assert_eq!(ks[0]["end_time"], 1_000_000 + 5_000);
+        assert!(ks[1].get("fifo_ready_time").is_none());
+        assert_eq!(ks[1]["start_time"], 1_000_000 + 1_000);
+        assert_eq!(ks[1]["end_time"], 1_000_000 + 12_000);
     }
 }

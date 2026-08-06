@@ -359,8 +359,9 @@ pub struct KernelStepLocal {
     pub peer: u8,
     pub step: u32,
     pub size: u32,
-    pub start_ptimer: u64,
-    pub stop_ptimer: Option<u64>,
+    pub start_ts: u64,
+    pub ready_ts: u64,
+    pub end_ts: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -806,8 +807,9 @@ where
                                         peer: descr.peer(),
                                         step: descr.step(),
                                         size: descr.size(),
-                                        start_ptimer: descr.start_ptimer(),
-                                        stop_ptimer: None,
+                                        start_ts: descr.start_ts(),
+                                        ready_ts: descr.ready_ts(),
+                                        end_ts: None,
                                     },
                                     None,
                                     true,
@@ -905,7 +907,7 @@ pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
         event::Event::KernelStep(step) => {
             thread_state.fifo.prefetch_next();
             if let Some(ncclop) = step.parent_op {
-                let stop = step.stop_ptimer.unwrap_or(step.start_ptimer);
+                let end = step.end_ts.unwrap_or(step.ready_ts);
                 let msg = daemon::Message::KernelStep(
                     event::KernelEventStep {
                         channel_id: step.channel_id,
@@ -913,8 +915,9 @@ pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
                         peer: step.peer,
                         step: step.step,
                         size: step.size,
-                        start_gpu_clk: step.start_ptimer,
-                        stop_gpu_clk: stop,
+                        start_ts: step.start_ts,
+                        ready_ts: step.ready_ts,
+                        end_ts: end,
                     },
                     ncclop,
                 );
@@ -1035,7 +1038,7 @@ pub fn record_kernelstep_event_state_handler(
         return Ok(());
     }
     if let event::Event::KernelStep(step) = event {
-        step.stop_ptimer = Some(p_timer);
+        step.end_ts = Some(p_timer);
     }
     Ok(())
 }
