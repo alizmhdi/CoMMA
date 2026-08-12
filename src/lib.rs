@@ -15,6 +15,7 @@
 pub mod clock;
 mod cloud_daemon;
 mod config;
+mod control_rpc;
 mod daemon;
 mod event;
 mod event_ffi;
@@ -27,7 +28,6 @@ mod otel_utils; // copybara:strip(otel)
 mod profiler;
 pub mod profiler_shim;
 mod runtime_gates;
-mod control_rpc;
 mod shm_fifo;
 mod slab;
 mod spsc;

@@ -126,8 +126,7 @@ pub mod proxy_event_state {
 
     pub mod v6 {
         use super::*;
-        pub const KERNEL_STEP_STOP: u32 =
-            ncclProfilerEventState_t_ncclProfilerKernelStepStop;
+        pub const KERNEL_STEP_STOP: u32 = ncclProfilerEventState_t_ncclProfilerKernelStepStop;
     }
 }
 

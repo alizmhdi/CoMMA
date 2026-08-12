@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::net::UnixStream;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -334,6 +335,20 @@ async fn build_bufwriter(
     }
 }
 
+async fn connect_latency_sock(path: impl AsRef<std::path::Path>) -> Option<UnixStream> {
+    match UnixStream::connect(&path).await {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            error!(
+                "Failed to connect latency telemetry socket {:?}: {}.",
+                path.as_ref().as_os_str(),
+                e
+            );
+            None
+        }
+    }
+}
+
 async fn exporter(
     profiler: &'static Profiler,
     mut rx: mpsc::Receiver<Telemetry>,
@@ -345,6 +360,18 @@ async fn exporter(
     } else {
         None
     };
+
+    let latency_sock_path = profiler
+        .config
+        .latency_sock
+        .as_ref()
+        .map(|template| template.replace("%p", &format!("{}", profiler.pid)));
+    let mut latency_sock = if let Some(path) = latency_sock_path.as_ref() {
+        connect_latency_sock(path).await
+    } else {
+        None
+    };
+    let mut next_latency_sock_retry = Instant::now();
 
     let mut summary_file = if let Some(template) = profiler.config.summary_file.as_ref() {
         let path = template.replace("%p", &format!("{}", profiler.pid));
@@ -419,6 +446,30 @@ async fn exporter(
                             if let Err(e) = r {
                                 error!("Failed to log latency telemetry to file: {}. Stop logging.", e);
                                 latency_file = None;
+                            }
+                        }
+
+                        if latency_sock.is_none() {
+                            if let Some(path) = latency_sock_path.as_ref() {
+                                if Instant::now() >= next_latency_sock_retry {
+                                    latency_sock = connect_latency_sock(path).await;
+                                    if latency_sock.is_none() {
+                                        next_latency_sock_retry = Instant::now() + Duration::from_secs(1);
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(stream) = latency_sock.as_mut() {
+                            let r = telemetry
+                                .write_to_file(
+                                    stream,
+                                    |t| profiler.instant_to_timestamp(t).as_micros() as _)
+                                .await;
+                            if let Err(e) = r {
+                                error!("Failed to stream latency telemetry to socket: {}. Will retry.", e);
+                                latency_sock = None;
+                                next_latency_sock_retry = Instant::now() + Duration::from_secs(1);
                             }
                         }
 

@@ -16,3 +16,6 @@ third_party/nccl/build/
 .DS_Store
 *.swp
 *~
+# Local tool caches
+.cargo-cache/
+.rustup-cache/

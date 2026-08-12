@@ -55,6 +55,7 @@ CoMMA can export raw telemetry data to local files in JSON format.
 | Environment Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `NCCL_PROFILER_LATENCY_FILE` | String | *None* | Path to the local file where raw event telemetry will be written (e.g., `/tmp/latency-%p.json`). Supports `%p` for PID. |
+| `NCCL_PROFILER_LATENCY_SOCK` | String | *None* | Unix stream socket for live raw event telemetry. Sends the same newline-delimited JSON as `LATENCY_FILE`; supports `%p` for PID but the monitor usually uses one shared socket per host. |
 | `NCCL_PROFILER_SUMMARY_FILE` | String | *None* | Path to the local file where periodic summaries will be written. |
 | `NCCL_PROFILER_SUMMARY_INTERVAL` | Duration | `60s` | Interval at which periodic summaries are calculated and written to `SUMMARY_FILE`. |
 

@@ -248,6 +248,7 @@ fn coll_type_to_num(t: nccl_metadata::NcclOpType) -> u32 {
         T::AllGather => 3,
         T::ReduceScatter => 4,
         T::AllReduce => 5,
+        T::AlltoAll => 6,
         _ => 0xabcd, // we don't use zero as zero span ID is invalid
     }
 }
@@ -261,6 +262,7 @@ fn ncclop_otel_name(op_type: nccl_metadata::NcclOpType) -> &'static str {
         NcclOpType::AllGather => "ncclAllGather",
         NcclOpType::ReduceScatter => "ncclReduceScatter",
         NcclOpType::AllReduce => "ncclAllReduce",
+        NcclOpType::AlltoAll => "ncclAlltoAll",
         NcclOpType::Send => "ncclSend",
         NcclOpType::Recv => "ncclRecv",
         _ => "unknown nccl op",

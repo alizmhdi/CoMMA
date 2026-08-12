@@ -99,6 +99,7 @@ pub enum NcclOpType {
     AllGather,
     ReduceScatter,
     AllReduce,
+    AlltoAll,
     Send,
     Recv,
     Unknown,
@@ -111,6 +112,7 @@ static NCCLOP_NAME_LOOKUP: LazyLock<HashMap<&'static CStr, NcclOpType>> = LazyLo
         (c"AllGather", NcclOpType::AllGather),
         (c"ReduceScatter", NcclOpType::ReduceScatter),
         (c"AllReduce", NcclOpType::AllReduce),
+        (c"AlltoAll", NcclOpType::AlltoAll),
         (c"Send", NcclOpType::Send),
         (c"Recv", NcclOpType::Recv),
     ]
@@ -129,6 +131,7 @@ impl NcclOpType {
             4 => NcclOpType::AllReduce,
             6 => NcclOpType::Send,
             7 => NcclOpType::Recv,
+            8 => NcclOpType::AlltoAll,
             _ => NcclOpType::Unknown,
         }
     }
@@ -147,6 +150,7 @@ impl NcclOpType {
             b'A' => match bytes[last_idx] {
                 b'r' => NcclOpType::AllGather,
                 b'e' => NcclOpType::AllReduce,
+                b'l' => NcclOpType::AlltoAll,
                 _ => NcclOpType::Unknown,
             },
             b'S' => NcclOpType::Send,
@@ -175,6 +179,7 @@ impl NcclOpType {
             NcclOpType::AllGather => "all_gather",
             NcclOpType::ReduceScatter => "reduce_scatter",
             NcclOpType::AllReduce => "all_reduce",
+            NcclOpType::AlltoAll => "all_to_all",
             NcclOpType::Send => "send",
             NcclOpType::Recv => "recv",
             _ => "unknown",
@@ -188,6 +193,7 @@ impl NcclOpType {
             NcclOpType::AllGather => c"all_gather",
             NcclOpType::ReduceScatter => c"reduce_scatter",
             NcclOpType::AllReduce => c"all_reduce",
+            NcclOpType::AlltoAll => c"all_to_all",
             NcclOpType::Send => c"send",
             NcclOpType::Recv => c"recv",
             _ => c"unknown",

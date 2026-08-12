@@ -3,6 +3,7 @@ name = "nccl-profiler"
 version = "0.3.0"
 edition = "2021"
 
+
 [profile.release]
 debug = 1
 opt-level = 3

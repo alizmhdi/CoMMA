@@ -340,12 +340,17 @@ impl<'a> PollingContext<'a> {
         // 1. we know the parent (and therefore comm hash)
         // 2. this proxyop is originated from current process OR
         //    we are tracking interprocess proxyop
+        // Prefer runtime gates (comma-monitor mid-flight enable) over the
+        // process-start Config snapshot.
+        let gates = &self.profiler.gates;
+        let track_steps = gates.track_steps();
+        let aggregate_cfg = gates.aggregate_steps();
+        let track_interprocess = gates.track_interprocess_proxyop();
         if info.parent().is_some() {
-            aggregate_steps = self.profiler.config.aggregate_steps
-                && (info.pid == self.profiler.pid
-                    || self.profiler.config.track_interprocess_proxyop);
+            aggregate_steps =
+                aggregate_cfg && (info.pid == self.profiler.pid || track_interprocess);
         }
-        op.init_step_tracking(self.profiler.config.track_steps, aggregate_steps);
+        op.init_step_tracking(track_steps, aggregate_steps);
         self.handle_proxyop_start(thread_state, info, op.basic_info().start_time());
 
         thread_state.proxyops.insert(id, op);
@@ -391,8 +396,11 @@ impl<'a> PollingContext<'a> {
         proxyops: Vec<Box<event::ProxyOp>>,
         send_ipc: bool,
     ) {
-        let config = &self.profiler.config;
-        let record_proxyop = config.track_proxyop || config.track_steps;
+        // Runtime gates: when the monitor escalates after an anomaly, newly
+        // completed ProxyOps must be attached to the parent COLL JSON even
+        // though process-start Config still has track_proxyop/steps=false.
+        let gates = &self.profiler.gates;
+        let record_proxyop = gates.track_proxyop() || gates.track_steps();
         if let Some(parent_handle) = info.parent() {
             if info.pid == self.profiler.pid {
                 if let Some(ncclop) = self.get_ncclop(parent_handle) {

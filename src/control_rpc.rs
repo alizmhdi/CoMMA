@@ -64,7 +64,11 @@ struct Response<'a> {
 }
 
 /// Resolve control socket path from config / latency file / env.
-pub fn resolve_sock_path(config_sock: Option<&str>, latency_file: Option<&str>, pid: libc::pid_t) -> Option<PathBuf> {
+pub fn resolve_sock_path(
+    config_sock: Option<&str>,
+    latency_file: Option<&str>,
+    pid: libc::pid_t,
+) -> Option<PathBuf> {
     let template = config_sock
         .map(str::to_string)
         .or_else(|| std::env::var("NCCL_PROFILER_CONTROL_SOCK").ok())

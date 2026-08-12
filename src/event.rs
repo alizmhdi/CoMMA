@@ -25,7 +25,7 @@ use crate::step_tracker::EventStep;
 use serde_json::json;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Debug)]
 pub enum Event {
@@ -134,8 +134,6 @@ pub struct NcclOp {
     descr: nccl_metadata::EventMetadata,
     proxyops: Option<Vec<ProxyOp>>,
     kernel_steps: Option<Vec<KernelEventStep>>,
-    kernel_step_min_start: Option<u64>,
-    kernel_step_max_stop: Option<u64>,
 }
 
 /// Per-slice Simple-prims KernelStep attached to a Coll/P2p NcclOp.
@@ -286,8 +284,6 @@ impl NcclOp {
             descr: descr.clone_to_metadata(),
             proxyops: None,
             kernel_steps: None,
-            kernel_step_min_start: None,
-            kernel_step_max_stop: None,
         }
     }
 
@@ -355,42 +351,12 @@ impl NcclOp {
     }
 
     pub fn add_kernel_step(&mut self, step: KernelEventStep) {
-        // Parent GPU span uses transfer begin (ready), excluding credit wait — like ProxyStep dur_ns.
-        let min_start = self
-            .kernel_step_min_start
-            .map_or(step.ready_ts, |start| start.min(step.ready_ts));
-        let max_stop = self
-            .kernel_step_max_stop
-            .map_or(step.end_ts, |stop| stop.max(step.end_ts));
-        self.kernel_step_min_start = Some(min_start);
-        self.kernel_step_max_stop = Some(max_stop);
-
+        // Nest only. Parent Coll/P2p timing is refined by KernelCh / ProxyOp,
+        // not by KernelStep GPU spans.
         if self.kernel_steps.is_none() {
             self.kernel_steps = Some(Vec::new());
         }
         self.kernel_steps.as_mut().unwrap().push(step);
-        self.refresh_timing_from_kernel_step_span();
-    }
-
-    /// Set host end_time from the GPU globaltimer span of attached KernelSteps
-    /// so Coll/P2p are not left reclaimed with dur=0 on SHM/intra-host paths
-    /// that have no ProxyOp/KernelCh completion.
-    fn refresh_timing_from_kernel_step_span(&mut self) {
-        let Some(min_start) = self.kernel_step_min_start else {
-            return;
-        };
-        let Some(max_stop) = self.kernel_step_max_stop else {
-            return;
-        };
-        if max_stop < min_start {
-            return;
-        }
-        let dur_ns = max_stop - min_start;
-        let st = self.basic_info.start_time();
-        // child_start ≈ enqueue; end = enqueue + GPU span (globaltimer is ns).
-        self.update_child_start_time(st);
-        self.basic_info
-            .update_end_time(st + Duration::from_nanos(dur_ns));
     }
 }
 
@@ -724,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_steps_set_parent_duration() {
+    fn kernel_steps_nested_without_refining_parent_duration() {
         let start = Instant::now();
         let mut descr: profiler_shim::ncclProfilerEventDescr_v4_t = unsafe { std::mem::zeroed() };
         descr.type_ = profiler_shim::ncclProfileColl as _;
@@ -741,8 +707,6 @@ mod tests {
             descr: nccl_metadata::EventMetadata::V4(profiler_shim::EventDescrV4(descr)),
             proxyops: None,
             kernel_steps: None,
-            kernel_step_min_start: None,
-            kernel_step_max_stop: None,
         };
 
         op.add_kernel_step(KernelEventStep {
@@ -763,29 +727,18 @@ mod tests {
             size: 4,
             start_ts: 0,
             ready_ts: 1_000_000 + 1_000,
-            end_ts: 1_000_000 + 12_000, // extends span to 12 us
-        });
-        op.add_kernel_step(KernelEventStep {
-            channel_id: 1,
-            is_send: false,
-            peer: 0,
-            step: 0,
-            size: 4,
-            start_ts: 0,
-            ready_ts: 1_000_000 - 1_000, // moves the cached minimum earlier
-            end_ts: 1_000_000 + 1_000,
+            end_ts: 1_000_000 + 12_000,
         });
 
-        let end = op
-            .basic_info
-            .end_time()
-            .expect("end_time set from kernel steps");
-        // Parent uses transfer-only: min ready=999_000, max end=1_012_000 → 13_000 ns
-        assert_eq!((end - start).as_nanos(), 13_000);
-        assert_eq!(op.child_start_time(), Some(start));
+        assert!(
+            op.basic_info.end_time().is_none(),
+            "KernelSteps must not refine parent end_time (KernelCh/ProxyOp do)"
+        );
+        assert_eq!(op.child_start_time(), None);
 
         let rec = op.trace_record(|_| 0);
         let ks = rec["kernel_steps"].as_array().expect("kernel_steps");
+        assert_eq!(ks.len(), 2);
         assert_eq!(ks[0]["start_time"], 1_000_000 - 2_000);
         assert_eq!(ks[0]["fifo_ready_time"], 1_000_000);
         assert_eq!(ks[0]["end_time"], 1_000_000 + 5_000);
