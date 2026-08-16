@@ -89,6 +89,9 @@ impl Telemetry {
             Telemetry::NcclOp(ncclop) => {
                 writeln!(buf, "{}", ncclop.trace_record(&mut time_to_num))?;
             }
+            Telemetry::P2pParent(parent) => {
+                writeln!(buf, "{}", parent.trace_record(&mut time_to_num))?;
+            }
             Telemetry::ProxyOp(proxyop) => {
                 writeln!(buf, "{}", proxyop.trace_record(&mut time_to_num))?;
             }

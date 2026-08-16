@@ -24,8 +24,11 @@ use crate::step_tracker::EventStep;
 
 use serde_json::json;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+static NEXT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub enum Event {
@@ -110,6 +113,7 @@ pub trait ProfilerEvent {
 #[repr(align(16))]
 pub struct Group {
     basic_info: BasicInfo,
+    id: u64,
 }
 
 impl Group {
@@ -119,7 +123,51 @@ impl Group {
     {
         Self {
             basic_info: BasicInfo::from_descr(descr, time),
+            id: NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// Parent covering every P2P send/recv in one NCCL group.
+/// Emitted as `cat: P2P_GROUP` (not COLL) when a group contains 2+ P2Ps
+/// and no native collective. `name` is `all_to_all` or `sendrecv`.
+#[derive(Debug, Clone)]
+pub struct P2pParent {
+    pub group_id: u64,
+    pub rank: usize,
+    pub comm_hash: u64,
+    pub start_time: Instant,
+    pub end_time: Instant,
+    pub size: usize,
+    pub n_children: usize,
+    pub n_peers: usize,
+    pub name: &'static str,
+}
+
+impl P2pParent {
+    pub fn trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        json!({
+            "ph": "X",
+            "ts": time_to_num(self.start_time),
+            "dur": (self.end_time.saturating_duration_since(self.start_time)).as_micros(),
+            "cat": "P2P_GROUP",
+            "name": self.name,
+            "rank": self.rank,
+            "comm_hash": format!("0x{:016x}", self.comm_hash),
+            "group_id": self.group_id,
+            "n_children": self.n_children,
+            "n_peers": self.n_peers,
+            "args": {
+                "size": self.size,
+            },
+        })
     }
 }
 
@@ -134,6 +182,8 @@ pub struct NcclOp {
     descr: nccl_metadata::EventMetadata,
     proxyops: Option<Vec<ProxyOp>>,
     kernel_steps: Option<Vec<KernelEventStep>>,
+    /// Stable NCCL Group id when this op was launched inside ncclGroupStart/End.
+    parent_group_id: Option<u64>,
 }
 
 /// Per-slice Simple-prims KernelStep attached to a Coll/P2p NcclOp.
@@ -284,7 +334,16 @@ impl NcclOp {
             descr: descr.clone_to_metadata(),
             proxyops: None,
             kernel_steps: None,
+            parent_group_id: event_ffi::peek_group_id(descr.parent_obj()),
         }
+    }
+
+    pub fn parent_group_id(&self) -> Option<u64> {
+        self.parent_group_id
+    }
+
+    pub fn clear_parent_group_id(&mut self) {
+        self.parent_group_id = None;
     }
 
     pub fn id(&self) -> usize {
@@ -399,6 +458,9 @@ impl ProfilerEvent for NcclOp {
             let p2p = self.descr.try_cast_to_p2p().unwrap();
             json["name"] = json!(if p2p.is_send() { "send" } else { "recv" });
             json["peer"] = json!(p2p.peer());
+        }
+        if let Some(gid) = self.parent_group_id {
+            json["parent"] = json!(gid);
         }
 
         if let Some(proxyops) = self.proxyops.as_ref() {
@@ -707,6 +769,7 @@ mod tests {
             descr: nccl_metadata::EventMetadata::V4(profiler_shim::EventDescrV4(descr)),
             proxyops: None,
             kernel_steps: None,
+            parent_group_id: None,
         };
 
         op.add_kernel_step(KernelEventStep {
@@ -745,5 +808,30 @@ mod tests {
         assert!(ks[1].get("fifo_ready_time").is_none());
         assert_eq!(ks[1]["start_time"], 1_000_000 + 1_000);
         assert_eq!(ks[1]["end_time"], 1_000_000 + 12_000);
+    }
+
+    #[test]
+    fn p2p_parent_emits_p2p_group() {
+        let start = Instant::now();
+        let parent = P2pParent {
+            group_id: 7,
+            rank: 1,
+            comm_hash: 0xabc,
+            start_time: start,
+            end_time: start + Duration::from_micros(250),
+            size: 4096,
+            n_children: 6,
+            n_peers: 3,
+            name: "all_to_all",
+        };
+        let rec = parent.trace_record(|_| 42);
+        assert_eq!(rec["cat"], "P2P_GROUP");
+        assert_eq!(rec["name"], "all_to_all");
+        assert_eq!(rec["group_id"], 7);
+        assert_eq!(rec["n_children"], 6);
+        assert_eq!(rec["n_peers"], 3);
+        assert_eq!(rec["comm_hash"], "0x0000000000000abc");
+        assert_eq!(rec["args"]["size"], 4096);
+        assert_eq!(rec["dur"], 250);
     }
 }

@@ -88,6 +88,22 @@ fn to_ncclop_handle(handle: Handle) -> usize {
     get_handle_inner(handle) >> N_TYPE_BITS
 }
 
+/// Read the monotonic Group id from a live NCCL Group handle without taking
+/// ownership. Returns None when `handle` is not a Group.
+pub fn peek_group_id(handle: Handle) -> Option<u64> {
+    if handle.is_null() || get_handle_type(handle) != Type::Group {
+        return None;
+    }
+    let ptr = get_handle_inner(handle) as *const Group;
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: NCCL holds the Group event until Group stop. P2P/COLL start
+        // runs while that parent Group handle is still live.
+        Some(unsafe { (*ptr).id() })
+    }
+}
+
 pub trait AsFFI: Sized {
     fn into_ffi(self) -> Handle;
 
@@ -306,6 +322,20 @@ mod tests {
         } else {
             panic!("failed to get group from ffi");
         }
+    }
+
+    #[test]
+    fn peek_group_id_matches_live_handle() {
+        let group_descr = dummy_group_descr();
+        let event = Event::new_group(&group_descr, Instant::now());
+        let Event::Group(ref group) = event else {
+            panic!("expected Group");
+        };
+        let want = group.id();
+        let handle = Event::into_ffi(event);
+        assert_eq!(peek_group_id(handle), Some(want));
+        // SAFETY: handle came from into_ffi in this test.
+        let _ = unsafe { Event::from_ffi(handle) };
     }
 
     #[test]
