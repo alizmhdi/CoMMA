@@ -24,8 +24,11 @@ use crate::step_tracker::EventStep;
 
 use serde_json::json;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+static NEXT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub enum Event {
@@ -34,6 +37,7 @@ pub enum Event {
     NcclOp(usize),
     ProxyOpLite(slab::AllocatedNode<profiler::ProxyOpLocalData>), // Lite == no step tracking
     KernelCh(slab::AllocatedNode<profiler::KernelCh>),
+    KernelStep(slab::AllocatedNode<profiler::KernelStepLocal>),
     ProxyOp(slab::AllocatedNode<profiler::ProxyOpLocalData>),
     Dummy(usize),
     SmallNcclOp(usize),
@@ -109,6 +113,7 @@ pub trait ProfilerEvent {
 #[repr(align(16))]
 pub struct Group {
     basic_info: BasicInfo,
+    id: u64,
 }
 
 impl Group {
@@ -118,7 +123,51 @@ impl Group {
     {
         Self {
             basic_info: BasicInfo::from_descr(descr, time),
+            id: NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// Parent covering every P2P send/recv in one NCCL group.
+/// Emitted as `cat: P2P_GROUP` (not COLL) when a group contains 2+ P2Ps
+/// and no native collective. `name` is `all_to_all` or `sendrecv`.
+#[derive(Debug, Clone)]
+pub struct P2pParent {
+    pub group_id: u64,
+    pub rank: usize,
+    pub comm_hash: u64,
+    pub start_time: Instant,
+    pub end_time: Instant,
+    pub size: usize,
+    pub n_children: usize,
+    pub n_peers: usize,
+    pub name: &'static str,
+}
+
+impl P2pParent {
+    pub fn trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        json!({
+            "ph": "X",
+            "ts": time_to_num(self.start_time),
+            "dur": (self.end_time.saturating_duration_since(self.start_time)).as_micros(),
+            "cat": "P2P_GROUP",
+            "name": self.name,
+            "rank": self.rank,
+            "comm_hash": format!("0x{:016x}", self.comm_hash),
+            "group_id": self.group_id,
+            "n_children": self.n_children,
+            "n_peers": self.n_peers,
+            "args": {
+                "size": self.size,
+            },
+        })
     }
 }
 
@@ -132,6 +181,25 @@ pub struct NcclOp {
     comm_hash: Option<u64>, // starting from v4 comm_hash is no longer part of the event descriptor
     descr: nccl_metadata::EventMetadata,
     proxyops: Option<Vec<ProxyOp>>,
+    kernel_steps: Option<Vec<KernelEventStep>>,
+    /// Stable NCCL Group id when this op was launched inside ncclGroupStart/End.
+    parent_group_id: Option<u64>,
+}
+
+/// Per-slice Simple-prims KernelStep attached to a Coll/P2p NcclOp.
+#[derive(Debug, Clone)]
+pub struct KernelEventStep {
+    pub channel_id: u8,
+    pub is_send: bool,
+    pub peer: u8,
+    pub step: u32,
+    pub size: u32,
+    /// NCCL `startTs`: wait/step begin; 0 if none/recv.
+    pub start_ts: u64,
+    /// NCCL `readyTs`: transfer/comm begin.
+    pub ready_ts: u64,
+    /// Stop-ring end time (GPU globaltimer).
+    pub end_ts: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -265,7 +333,17 @@ impl NcclOp {
             comm_hash: comm_hash_override,
             descr: descr.clone_to_metadata(),
             proxyops: None,
+            kernel_steps: None,
+            parent_group_id: event_ffi::peek_group_id(descr.parent_obj()),
         }
+    }
+
+    pub fn parent_group_id(&self) -> Option<u64> {
+        self.parent_group_id
+    }
+
+    pub fn clear_parent_group_id(&mut self) {
+        self.parent_group_id = None;
     }
 
     pub fn id(&self) -> usize {
@@ -330,6 +408,15 @@ impl NcclOp {
         }
         self.proxyops.as_mut().unwrap().push(proxyop);
     }
+
+    pub fn add_kernel_step(&mut self, step: KernelEventStep) {
+        // Nest only. Parent Coll/P2p timing is refined by KernelCh / ProxyOp,
+        // not by KernelStep GPU spans.
+        if self.kernel_steps.is_none() {
+            self.kernel_steps = Some(Vec::new());
+        }
+        self.kernel_steps.as_mut().unwrap().push(step);
+    }
 }
 
 impl ProfilerEvent for NcclOp {
@@ -372,11 +459,41 @@ impl ProfilerEvent for NcclOp {
             json["name"] = json!(if p2p.is_send() { "send" } else { "recv" });
             json["peer"] = json!(p2p.peer());
         }
+        if let Some(gid) = self.parent_group_id {
+            json["parent"] = json!(gid);
+        }
 
         if let Some(proxyops) = self.proxyops.as_ref() {
             json["proxyops"] = proxyops
                 .iter()
                 .map(|op| op.trace_record(&mut time_to_num))
+                .collect();
+        }
+
+        if let Some(steps) = self.kernel_steps.as_ref() {
+            json["kernel_steps"] = steps
+                .iter()
+                .map(|s| {
+                    // Same JSON keys as ProxyStep: start_time → fifo_ready_time → end_time.
+                    let start_time = if s.start_ts != 0 {
+                        s.start_ts
+                    } else {
+                        s.ready_ts
+                    };
+                    let mut r = json!({
+                        "channel": s.channel_id,
+                        "is_send": s.is_send,
+                        "peer": s.peer,
+                        "step": s.step,
+                        "size": s.size,
+                        "start_time": start_time,
+                        "end_time": s.end_ts,
+                    });
+                    if s.start_ts != 0 {
+                        r["fifo_ready_time"] = json!(s.ready_ts);
+                    }
+                    r
+                })
                 .collect();
         }
 
@@ -632,5 +749,89 @@ mod tests {
         basic_info.update_end_time(t1);
         basic_info.update_end_time(t0);
         assert_eq!(basic_info.end_time(), Some(t1));
+    }
+
+    #[test]
+    fn kernel_steps_nested_without_refining_parent_duration() {
+        let start = Instant::now();
+        let mut descr: profiler_shim::ncclProfilerEventDescr_v4_t = unsafe { std::mem::zeroed() };
+        descr.type_ = profiler_shim::ncclProfileColl as _;
+        let mut op = NcclOp {
+            basic_info: BasicInfo {
+                rank: 0,
+                start_time: start,
+                end_time: None,
+            },
+            id: 0,
+            is_p2p: false,
+            child_start_time: None,
+            comm_hash: Some(0x123),
+            descr: nccl_metadata::EventMetadata::V4(profiler_shim::EventDescrV4(descr)),
+            proxyops: None,
+            kernel_steps: None,
+            parent_group_id: None,
+        };
+
+        op.add_kernel_step(KernelEventStep {
+            channel_id: 0,
+            is_send: true,
+            peer: 0,
+            step: 1,
+            size: 4,
+            start_ts: 1_000_000 - 2_000, // wait begin
+            ready_ts: 1_000_000,         // transfer begin
+            end_ts: 1_000_000 + 5_000,   // 5 us transfer
+        });
+        op.add_kernel_step(KernelEventStep {
+            channel_id: 0,
+            is_send: false,
+            peer: 0,
+            step: 1,
+            size: 4,
+            start_ts: 0,
+            ready_ts: 1_000_000 + 1_000,
+            end_ts: 1_000_000 + 12_000,
+        });
+
+        assert!(
+            op.basic_info.end_time().is_none(),
+            "KernelSteps must not refine parent end_time (KernelCh/ProxyOp do)"
+        );
+        assert_eq!(op.child_start_time(), None);
+
+        let rec = op.trace_record(|_| 0);
+        let ks = rec["kernel_steps"].as_array().expect("kernel_steps");
+        assert_eq!(ks.len(), 2);
+        assert_eq!(ks[0]["start_time"], 1_000_000 - 2_000);
+        assert_eq!(ks[0]["fifo_ready_time"], 1_000_000);
+        assert_eq!(ks[0]["end_time"], 1_000_000 + 5_000);
+        assert!(ks[1].get("fifo_ready_time").is_none());
+        assert_eq!(ks[1]["start_time"], 1_000_000 + 1_000);
+        assert_eq!(ks[1]["end_time"], 1_000_000 + 12_000);
+    }
+
+    #[test]
+    fn p2p_parent_emits_p2p_group() {
+        let start = Instant::now();
+        let parent = P2pParent {
+            group_id: 7,
+            rank: 1,
+            comm_hash: 0xabc,
+            start_time: start,
+            end_time: start + Duration::from_micros(250),
+            size: 4096,
+            n_children: 6,
+            n_peers: 3,
+            name: "all_to_all",
+        };
+        let rec = parent.trace_record(|_| 42);
+        assert_eq!(rec["cat"], "P2P_GROUP");
+        assert_eq!(rec["name"], "all_to_all");
+        assert_eq!(rec["group_id"], 7);
+        assert_eq!(rec["n_children"], 6);
+        assert_eq!(rec["n_peers"], 3);
+        assert_eq!(rec["comm_hash"], "0x0000000000000abc");
+        assert_eq!(rec["args"]["size"], 4096);
+        assert_eq!(rec["dur"], 250);
     }
 }

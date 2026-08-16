@@ -99,6 +99,7 @@ pub enum NcclOpType {
     AllGather,
     ReduceScatter,
     AllReduce,
+    AlltoAll,
     Send,
     Recv,
     Unknown,
@@ -111,6 +112,7 @@ static NCCLOP_NAME_LOOKUP: LazyLock<HashMap<&'static CStr, NcclOpType>> = LazyLo
         (c"AllGather", NcclOpType::AllGather),
         (c"ReduceScatter", NcclOpType::ReduceScatter),
         (c"AllReduce", NcclOpType::AllReduce),
+        (c"AlltoAll", NcclOpType::AlltoAll),
         (c"Send", NcclOpType::Send),
         (c"Recv", NcclOpType::Recv),
     ]
@@ -129,6 +131,7 @@ impl NcclOpType {
             4 => NcclOpType::AllReduce,
             6 => NcclOpType::Send,
             7 => NcclOpType::Recv,
+            8 => NcclOpType::AlltoAll,
             _ => NcclOpType::Unknown,
         }
     }
@@ -147,6 +150,7 @@ impl NcclOpType {
             b'A' => match bytes[last_idx] {
                 b'r' => NcclOpType::AllGather,
                 b'e' => NcclOpType::AllReduce,
+                b'l' => NcclOpType::AlltoAll,
                 _ => NcclOpType::Unknown,
             },
             b'S' => NcclOpType::Send,
@@ -175,6 +179,7 @@ impl NcclOpType {
             NcclOpType::AllGather => "all_gather",
             NcclOpType::ReduceScatter => "reduce_scatter",
             NcclOpType::AllReduce => "all_reduce",
+            NcclOpType::AlltoAll => "all_to_all",
             NcclOpType::Send => "send",
             NcclOpType::Recv => "recv",
             _ => "unknown",
@@ -188,6 +193,7 @@ impl NcclOpType {
             NcclOpType::AllGather => c"all_gather",
             NcclOpType::ReduceScatter => c"reduce_scatter",
             NcclOpType::AllReduce => c"all_reduce",
+            NcclOpType::AlltoAll => c"all_to_all",
             NcclOpType::Send => c"send",
             NcclOpType::Recv => c"recv",
             _ => c"unknown",
@@ -539,6 +545,7 @@ pub enum EventMetadata {
     V2(profiler_shim::EventDescrV2),
     V3(profiler_shim::EventDescrV3),
     V4(profiler_shim::EventDescrV4),
+    V6(profiler_shim::EventDescrV6),
 }
 
 /// # Safety
@@ -555,6 +562,7 @@ impl EventMetadata {
             Self::V2(descr) => NcclOpKey::from_descr(descr, alt_comm_hash),
             Self::V3(descr) => NcclOpKey::from_descr(descr, alt_comm_hash),
             Self::V4(descr) => NcclOpKey::from_descr(descr, alt_comm_hash),
+            Self::V6(descr) => NcclOpKey::from_descr(descr, alt_comm_hash),
         }
     }
 
@@ -568,6 +576,7 @@ impl EventMetadata {
             Self::V2(descr) => event_byte_count(descr),
             Self::V3(descr) => event_byte_count(descr),
             Self::V4(descr) => event_byte_count(descr),
+            Self::V6(descr) => event_byte_count(descr),
         }
     }
 
@@ -577,6 +586,7 @@ impl EventMetadata {
             Self::V2(descr) => descr.try_cast_to_coll().map(|x| x as _),
             Self::V3(descr) => descr.try_cast_to_coll().map(|x| x as _),
             Self::V4(descr) => descr.try_cast_to_coll().map(|x| x as _),
+            Self::V6(descr) => descr.try_cast_to_coll().map(|x| x as _),
         }
     }
 
@@ -586,13 +596,14 @@ impl EventMetadata {
             Self::V2(descr) => descr.try_cast_to_p2p().map(|x| x as _),
             Self::V3(descr) => descr.try_cast_to_p2p().map(|x| x as _),
             Self::V4(descr) => descr.try_cast_to_p2p().map(|x| x as _),
+            Self::V6(descr) => descr.try_cast_to_p2p().map(|x| x as _),
         }
     }
 }
 
 pub trait Event {
     fn rank(&self) -> i32;
-    fn type_(&self) -> u8;
+    fn type_(&self) -> u64;
     fn parent_obj(&self) -> *mut libc::c_void;
     fn clone_to_metadata(&self) -> EventMetadata;
 }
@@ -602,6 +613,7 @@ pub trait Version: Event {
     type P2p: P2p;
     type ProxyOp: ProxyOp;
     type ProxyStep: ProxyStep;
+    type KernelStep: KernelStep;
 
     fn version() -> profiler::Version;
 
@@ -637,6 +649,15 @@ pub trait Version: Event {
     /// type of this descriptor must be proxystep
     #[inline(always)]
     unsafe fn cast_to_proxystep(&self) -> &Self::ProxyStep {
+        let ptr = self as *const Self;
+        &*ptr.cast()
+    }
+
+    /// # Safety
+    ///
+    /// type of this descriptor must be kernelstep (API v6+)
+    #[inline(always)]
+    unsafe fn cast_to_kernelstep(&self) -> &Self::KernelStep {
         let ptr = self as *const Self;
         &*ptr.cast()
     }
@@ -725,6 +746,37 @@ pub trait ProxyStep: Event {
     fn step(&self) -> i32;
 }
 
+/// Per-slice Simple-prims kernel step (profiler API v6+).
+pub trait KernelStep: Event {
+    fn channel_id(&self) -> u8;
+    fn is_send(&self) -> bool;
+    fn peer(&self) -> u8;
+    fn step(&self) -> u32;
+    fn size(&self) -> u32;
+    /// Wait/step begin (GPU globaltimer); 0 if none/recv.
+    fn start_ts(&self) -> u64;
+    /// Transfer/comm begin (GPU globaltimer).
+    fn ready_ts(&self) -> u64;
+    /// CoMMA ProxyStep-style wait: `ready_ts - start_ts` when `start_ts != 0`.
+    fn fifo_wait_dur_ns(&self) -> u32 {
+        derive_fifo_wait_dur_ns(self.start_ts(), self.ready_ts())
+    }
+}
+
+/// Derive ProxyStep-compatible `fifo_wait_dur_ns` from NCCL `startTs`/`readyTs`.
+#[inline(always)]
+pub fn derive_fifo_wait_dur_ns(start_ts: u64, ready_ts: u64) -> u32 {
+    if start_ts == 0 || ready_ts <= start_ts {
+        return 0;
+    }
+    let d = ready_ts - start_ts;
+    if d > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        d as u32
+    }
+}
+
 pub trait ProxyOpState {
     fn version() -> profiler::Version;
     fn steps(&self) -> i32;
@@ -744,8 +796,8 @@ macro_rules! impl_event {
             }
 
             #[inline(always)]
-            fn type_(&self) -> u8 {
-                self.0.type_()
+            fn type_(&self) -> u64 {
+                self.0.type_() as u64
             }
 
             #[inline(always)]
@@ -770,8 +822,8 @@ macro_rules! descr_impl_event {
             }
 
             #[inline(always)]
-            fn type_(&self) -> u8 {
-                self.0.type_
+            fn type_(&self) -> u64 {
+                self.0.type_ as u64
             }
 
             #[inline(always)]
@@ -959,6 +1011,84 @@ macro_rules! def_proxystep {
     };
 }
 
+/// Stub KernelStep for profiler API versions that lack the union field.
+/// Must never be cast to outside of dead code paths (mask gated on V6).
+macro_rules! def_kernelstep_unsupported {
+    ($t:tt, $d:tt) => {
+        #[allow(unused_parens)]
+        #[repr(transparent)]
+        pub struct $t($d);
+        impl super::KernelStep for $t {
+            fn channel_id(&self) -> u8 {
+                panic!("KernelStep unsupported on this profiler API version")
+            }
+            fn is_send(&self) -> bool {
+                panic!("KernelStep unsupported on this profiler API version")
+            }
+            fn peer(&self) -> u8 {
+                panic!("KernelStep unsupported on this profiler API version")
+            }
+            fn step(&self) -> u32 {
+                panic!("KernelStep unsupported on this profiler API version")
+            }
+            fn size(&self) -> u32 {
+                panic!("KernelStep unsupported on this profiler API version")
+            }
+            fn start_ts(&self) -> u64 {
+                panic!("KernelStep unsupported on this profiler API version")
+            }
+            fn ready_ts(&self) -> u64 {
+                panic!("KernelStep unsupported on this profiler API version")
+            }
+        }
+    };
+}
+
+macro_rules! def_kernelstep {
+    ($t:tt, $d:tt) => {
+        #[allow(unused_parens)]
+        #[repr(transparent)]
+        pub struct $t($d);
+        impl super::KernelStep for $t {
+            #[inline(always)]
+            fn channel_id(&self) -> u8 {
+                let s = unsafe { &self.0 .0.__bindgen_anon_1.kernelStep };
+                s.channelId
+            }
+            #[inline(always)]
+            fn is_send(&self) -> bool {
+                let s = unsafe { &self.0 .0.__bindgen_anon_1.kernelStep };
+                s.isSend != 0
+            }
+            #[inline(always)]
+            fn peer(&self) -> u8 {
+                let s = unsafe { &self.0 .0.__bindgen_anon_1.kernelStep };
+                s.peer
+            }
+            #[inline(always)]
+            fn step(&self) -> u32 {
+                let s = unsafe { &self.0 .0.__bindgen_anon_1.kernelStep };
+                s.step
+            }
+            #[inline(always)]
+            fn size(&self) -> u32 {
+                let s = unsafe { &self.0 .0.__bindgen_anon_1.kernelStep };
+                s.size
+            }
+            #[inline(always)]
+            fn start_ts(&self) -> u64 {
+                let s = unsafe { &self.0 .0.__bindgen_anon_1.kernelStep };
+                s.startTs
+            }
+            #[inline(always)]
+            fn ready_ts(&self) -> u64 {
+                let s = unsafe { &self.0 .0.__bindgen_anon_1.kernelStep };
+                s.readyTs
+            }
+        }
+    };
+}
+
 mod v1 {
     use super::algo::IntoAlgo;
     use super::proto::IntoProto;
@@ -986,6 +1116,9 @@ mod v1 {
 
     def_proxystep!(ProxyStep, (profiler_shim::EventDescrV1));
     impl_event!(ProxyStep, EventMetadata::V1);
+
+    def_kernelstep_unsupported!(KernelStep, (profiler_shim::EventDescrV1));
+    impl_event!(KernelStep, EventMetadata::V1);
 }
 
 mod v2 {
@@ -1015,6 +1148,9 @@ mod v2 {
 
     def_proxystep!(ProxyStep, (profiler_shim::EventDescrV2));
     impl_event!(ProxyStep, EventMetadata::V2);
+
+    def_kernelstep_unsupported!(KernelStep, (profiler_shim::EventDescrV2));
+    impl_event!(KernelStep, EventMetadata::V2);
 }
 
 mod v3 {
@@ -1044,6 +1180,9 @@ mod v3 {
 
     def_proxystep!(ProxyStep, (profiler_shim::EventDescrV3));
     impl_event!(ProxyStep, EventMetadata::V3);
+
+    def_kernelstep_unsupported!(KernelStep, (profiler_shim::EventDescrV3));
+    impl_event!(KernelStep, EventMetadata::V3);
 }
 
 mod v4 {
@@ -1109,6 +1248,77 @@ mod v4 {
 
     def_proxystep!(ProxyStep, (profiler_shim::EventDescrV4));
     impl_event!(ProxyStep, EventMetadata::V4);
+
+    def_kernelstep_unsupported!(KernelStep, (profiler_shim::EventDescrV4));
+    impl_event!(KernelStep, EventMetadata::V4);
+}
+
+mod v6 {
+    use super::algo::IntoAlgo;
+    use super::proto::IntoProto;
+    use super::*;
+
+    #[repr(transparent)]
+    pub struct Coll(profiler_shim::EventDescrV6);
+
+    impl_event!(Coll, EventMetadata::V6);
+
+    impl NcclOp for Coll {
+        // SAFETY: this type could only be constructed via cast_*(),
+        // which must be called with type_ == ncclProfileColl.
+        // Therefore accessing the corresponding union field is safe.
+
+        #[inline(always)]
+        fn comm_hash(&self) -> Option<u64> {
+            None
+        }
+
+        #[inline(always)]
+        fn byte_count(&self) -> usize {
+            let coll = unsafe { &self.0 .0.__bindgen_anon_1.coll };
+            let dt_bytes = unsafe { datatype_c_str_ptr_to_nbytes(coll.datatype) };
+            (coll.count * dt_bytes) as _
+        }
+    }
+
+    impl_coll!(Coll, nChannels);
+
+    #[repr(transparent)]
+    pub struct P2p(profiler_shim::EventDescrV6);
+
+    impl_event!(P2p, EventMetadata::V6);
+
+    impl NcclOp for P2p {
+        // SAFETY: this type could only be constructed via cast_*(),
+        // which must be called with type_ == ncclProfileP2p.
+        // Therefore accessing the corresponding union field is safe.
+
+        #[inline(always)]
+        fn comm_hash(&self) -> Option<u64> {
+            None
+        }
+
+        #[inline(always)]
+        fn byte_count(&self) -> usize {
+            let p2p = unsafe { &self.0 .0.__bindgen_anon_1.p2p };
+            let dt_bytes = unsafe { datatype_c_str_ptr_to_nbytes(p2p.datatype) };
+            (p2p.count * dt_bytes) as _
+        }
+    }
+
+    impl_p2p!(P2p);
+
+    #[repr(transparent)]
+    pub struct ProxyOp(profiler_shim::EventDescrV6);
+
+    impl_event!(ProxyOp, EventMetadata::V6);
+    impl_proxyop!(ProxyOp);
+
+    def_proxystep!(ProxyStep, (profiler_shim::EventDescrV6));
+    impl_event!(ProxyStep, EventMetadata::V6);
+
+    def_kernelstep!(KernelStep, (profiler_shim::EventDescrV6));
+    impl_event!(KernelStep, EventMetadata::V6);
 }
 
 descr_impl_event!(profiler_shim::EventDescrV1, EventMetadata::V1);
@@ -1118,6 +1328,7 @@ impl Version for profiler_shim::EventDescrV1 {
     type P2p = v1::P2p;
     type ProxyOp = v1::ProxyOp;
     type ProxyStep = v1::ProxyStep;
+    type KernelStep = v1::KernelStep;
 
     fn version() -> profiler::Version {
         profiler::Version::V1
@@ -1131,6 +1342,7 @@ impl Version for profiler_shim::EventDescrV2 {
     type P2p = v2::P2p;
     type ProxyOp = v2::ProxyOp;
     type ProxyStep = v2::ProxyStep;
+    type KernelStep = v2::KernelStep;
 
     fn version() -> profiler::Version {
         profiler::Version::V2
@@ -1144,6 +1356,7 @@ impl Version for profiler_shim::EventDescrV3 {
     type P2p = v3::P2p;
     type ProxyOp = v3::ProxyOp;
     type ProxyStep = v3::ProxyStep;
+    type KernelStep = v3::KernelStep;
 
     fn version() -> profiler::Version {
         profiler::Version::V3
@@ -1157,9 +1370,24 @@ impl Version for profiler_shim::EventDescrV4 {
     type P2p = v4::P2p;
     type ProxyOp = v4::ProxyOp;
     type ProxyStep = v4::ProxyStep;
+    type KernelStep = v4::KernelStep;
 
     fn version() -> profiler::Version {
         profiler::Version::V4
+    }
+}
+
+descr_impl_event!(profiler_shim::EventDescrV6, EventMetadata::V6);
+
+impl Version for profiler_shim::EventDescrV6 {
+    type Coll = v6::Coll;
+    type P2p = v6::P2p;
+    type ProxyOp = v6::ProxyOp;
+    type ProxyStep = v6::ProxyStep;
+    type KernelStep = v6::KernelStep;
+
+    fn version() -> profiler::Version {
+        profiler::Version::V6
     }
 }
 
@@ -1240,9 +1468,46 @@ impl ProxyStepState for ProxyStepStateV4 {
     }
 }
 
+/// V6 state args are typedef'd to v5 (includes kernelStep.pTimer).
+#[repr(transparent)]
+pub struct ProxyStepStateV6(profiler_shim::ncclProfilerEventStateArgs_v6_t);
+
+impl ProxyStepStateV6 {
+    /// # Safety
+    ///
+    /// input must be known to be a proxystep variant.
+    pub unsafe fn cast_from_union(u: &profiler_shim::ncclProfilerEventStateArgs_v6_t) -> &Self {
+        let ptr = u as *const profiler_shim::ncclProfilerEventStateArgs_v6_t;
+        &*ptr.cast()
+    }
+
+    #[inline(always)]
+    pub fn kernel_step_ptimer(&self) -> u64 {
+        unsafe { self.0.kernelStep.pTimer }
+    }
+}
+
+impl ProxyStepState for ProxyStepStateV6 {
+    fn trans_size(&self) -> usize {
+        unsafe { self.0.proxyStep.transSize }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_fifo_wait_from_timestamps() {
+        assert_eq!(derive_fifo_wait_dur_ns(0, 1_000_000), 0);
+        assert_eq!(derive_fifo_wait_dur_ns(1_000_000, 1_000_000), 0);
+        assert_eq!(derive_fifo_wait_dur_ns(1_000_000, 999_999), 0);
+        assert_eq!(derive_fifo_wait_dur_ns(1_000_000, 1_002_000), 2_000);
+        assert_eq!(
+            derive_fifo_wait_dur_ns(1, 1 + (u32::MAX as u64) + 10),
+            u32::MAX
+        );
+    }
 
     #[test]
     fn to_json_lossless() {

@@ -16,6 +16,7 @@ use crate::event;
 use crate::event::ProfilerEvent as _;
 use crate::fixed_batch;
 use crate::nccl_metadata;
+use crate::nccl_metadata::P2p as _;
 use crate::profiler;
 use crate::profiler::Communicator;
 use crate::profiler::Profiler;
@@ -26,7 +27,7 @@ use crate::step_tracker::EventStep;
 
 use log::error;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -118,6 +119,8 @@ impl<T> FifoReceiver<T> {
 #[derive(Debug)]
 pub enum ControlMessage {
     NewThread(ThreadControl),
+    /// Apply runtime gate update (also used by tests / future IPC).
+    SetGates(crate::runtime_gates::GateUpdate),
 }
 
 #[derive(Debug)]
@@ -141,6 +144,7 @@ pub enum Message {
         /* duration ns */ u64,
         /* parent handle */ usize,
     ),
+    KernelStep(event::KernelEventStep, /* parent handle */ usize),
     CommOpen(Communicator),
     CommClose(/* comm_hash = */ u64),
 }
@@ -170,9 +174,31 @@ pub enum Telemetry {
     Group(Box<event::Group>),
     NcclOpIssued(Box<event::NcclOp>), // copybara:strip(hang detection)
     NcclOp(Box<event::NcclOp>),
+    P2pParent(Box<event::P2pParent>),
     ProxyOp(Box<event::ProxyOp>),
     CommOpen(Communicator),
     CommClose(/* comm_hash = */ u64),
+}
+
+/// Accumulator for P2Ps (and optional COLLs) that share one NCCL Group.
+#[derive(Default)]
+struct P2pGroupAcc {
+    expected: usize,
+    completed: usize,
+    ended: bool,
+    has_coll: bool,
+    min_start: Option<Instant>,
+    max_end: Option<Instant>,
+    send_bytes: usize,
+    peers: HashSet<i32>,
+    comm_hash: u64,
+    rank: usize,
+}
+
+impl P2pGroupAcc {
+    fn will_emit_parent(&self) -> bool {
+        self.ended && !self.has_coll && self.expected >= 2
+    }
 }
 
 pub struct PollingContext<'a> {
@@ -187,6 +213,7 @@ pub struct PollingContext<'a> {
 
     peer_rank_fifo: HashMap<libc::pid_t, shm_fifo::mpsc::Sender<InterProcessMessage>>,
     pending_ipc_msg: HashMap<libc::pid_t, VecDeque<InterProcessMessage>>,
+    p2p_groups: HashMap<u64, P2pGroupAcc>,
 }
 
 impl<'a> PollingContext<'a> {
@@ -201,10 +228,104 @@ impl<'a> PollingContext<'a> {
             free_step_batch: slab::FreeList::default(),
             peer_rank_fifo: HashMap::new(),
             pending_ipc_msg: HashMap::new(),
+            p2p_groups: HashMap::new(),
         }
     }
 
-    fn reclaim_ncclop(&mut self, op: event::NcclOp) {
+    fn note_ncclop_start(&mut self, op: &event::NcclOp) {
+        let Some(gid) = op.parent_group_id() else {
+            return;
+        };
+        let g = self.p2p_groups.entry(gid).or_default();
+        if op.is_p2p() {
+            g.expected += 1;
+        } else {
+            g.has_coll = true;
+        }
+    }
+
+    fn record_p2p_completion(&mut self, op: &event::NcclOp) {
+        let Some(gid) = op.parent_group_id() else {
+            return;
+        };
+        let g = self.p2p_groups.entry(gid).or_default();
+        g.completed += 1;
+        let start = op.basic_info().start_time();
+        g.min_start = Some(g.min_start.map_or(start, |t| t.min(start)));
+        if let Some(end) = op.basic_info().end_time() {
+            g.max_end = Some(g.max_end.map_or(end, |t| t.max(end)));
+        }
+        g.comm_hash = op.comm_hash();
+        g.rank = op.basic_info().rank();
+        if let Some(p2p) = op.get_descr().try_cast_to_p2p() {
+            g.peers.insert(p2p.peer());
+            if p2p.is_send() {
+                g.send_bytes = g.send_bytes.saturating_add(op.byte_count());
+            }
+        }
+    }
+
+    fn will_emit_parent(&self, gid: u64) -> bool {
+        self.p2p_groups
+            .get(&gid)
+            .map(P2pGroupAcc::will_emit_parent)
+            .unwrap_or(false)
+    }
+
+    fn try_emit_p2p_parent(&mut self, gid: u64) {
+        let Some(g) = self.p2p_groups.get(&gid) else {
+            return;
+        };
+        if !(g.will_emit_parent() && g.completed == g.expected) {
+            return;
+        }
+        let g = self.p2p_groups.remove(&gid).unwrap();
+        let start = g.min_start.unwrap_or_else(Instant::now);
+        let end = g.max_end.unwrap_or(start);
+        let name = if g.peers.len() >= 2 {
+            "all_to_all"
+        } else {
+            "sendrecv"
+        };
+        self.pending_telemetry
+            .push_back(Telemetry::P2pParent(Box::new(event::P2pParent {
+                group_id: gid,
+                rank: g.rank,
+                comm_hash: g.comm_hash,
+                start_time: start,
+                end_time: if end > start { end } else { start },
+                size: g.send_bytes,
+                n_children: g.completed,
+                n_peers: g.peers.len(),
+                name,
+            })));
+    }
+
+    fn flush_p2p_parents(&mut self) {
+        let gids: Vec<u64> = self.p2p_groups.keys().copied().collect();
+        for gid in gids {
+            if let Some(g) = self.p2p_groups.get_mut(&gid) {
+                if g.ended && !g.has_coll && g.completed >= 2 {
+                    g.expected = g.completed;
+                }
+            }
+            self.try_emit_p2p_parent(gid);
+        }
+    }
+
+    fn reclaim_ncclop(&mut self, mut op: event::NcclOp) {
+        if let Some(gid) = op.parent_group_id() {
+            if op.is_p2p() {
+                self.record_p2p_completion(&op);
+                if !self.will_emit_parent(gid) {
+                    op.clear_parent_group_id();
+                }
+                self.pending_telemetry
+                    .push_back(Telemetry::NcclOp(Box::new(op)));
+                self.try_emit_p2p_parent(gid);
+                return;
+            }
+        }
         self.pending_telemetry
             .push_back(Telemetry::NcclOp(Box::new(op)));
     }
@@ -337,12 +458,17 @@ impl<'a> PollingContext<'a> {
         // 1. we know the parent (and therefore comm hash)
         // 2. this proxyop is originated from current process OR
         //    we are tracking interprocess proxyop
+        // Prefer runtime gates (comma-monitor mid-flight enable) over the
+        // process-start Config snapshot.
+        let gates = &self.profiler.gates;
+        let track_steps = gates.track_steps();
+        let aggregate_cfg = gates.aggregate_steps();
+        let track_interprocess = gates.track_interprocess_proxyop();
         if info.parent().is_some() {
-            aggregate_steps = self.profiler.config.aggregate_steps
-                && (info.pid == self.profiler.pid
-                    || self.profiler.config.track_interprocess_proxyop);
+            aggregate_steps =
+                aggregate_cfg && (info.pid == self.profiler.pid || track_interprocess);
         }
-        op.init_step_tracking(self.profiler.config.track_steps, aggregate_steps);
+        op.init_step_tracking(track_steps, aggregate_steps);
         self.handle_proxyop_start(thread_state, info, op.basic_info().start_time());
 
         thread_state.proxyops.insert(id, op);
@@ -388,8 +514,11 @@ impl<'a> PollingContext<'a> {
         proxyops: Vec<Box<event::ProxyOp>>,
         send_ipc: bool,
     ) {
-        let config = &self.profiler.config;
-        let record_proxyop = config.track_proxyop || config.track_steps;
+        // Runtime gates: when the monitor escalates after an anomaly, newly
+        // completed ProxyOps must be attached to the parent COLL JSON even
+        // though process-start Config still has track_proxyop/steps=false.
+        let gates = &self.profiler.gates;
+        let record_proxyop = gates.track_proxyop() || gates.track_steps();
         if let Some(parent_handle) = info.parent() {
             if info.pid == self.profiler.pid {
                 if let Some(ncclop) = self.get_ncclop(parent_handle) {
@@ -432,6 +561,9 @@ impl<'a> PollingContext<'a> {
     {
         match msg {
             Message::Group(group) => {
+                let gid = group.id();
+                self.p2p_groups.entry(gid).or_default().ended = true;
+                self.try_emit_p2p_parent(gid);
                 if self.profiler.config.track_group {
                     self.pending_telemetry.push_back(Telemetry::Group(group));
                 }
@@ -439,6 +571,7 @@ impl<'a> PollingContext<'a> {
             Message::NcclOp(op) => {
                 let id = op.id();
                 let op = self.free_ncclop.take_and_free(op);
+                self.note_ncclop_start(&op);
                 let _ = self.ncclops.insert(id, Box::new(op.clone()));
                 // copybara:strip_begin(hang detection)
                 self.pending_telemetry
@@ -547,6 +680,11 @@ impl<'a> PollingContext<'a> {
                         start_time,
                         Some(start_time + Duration::from_nanos(duration)),
                     );
+                }
+            }
+            Message::KernelStep(step, parent) => {
+                if let Some(ncclop) = self.get_ncclop(parent) {
+                    ncclop.add_kernel_step(step);
                 }
             }
             Message::CommOpen(comm) => {
@@ -731,6 +869,9 @@ where
                     ctrl.daemon_state.idx = threads.len();
                     threads.push(ctrl);
                 }
+                ControlMessage::SetGates(update) => {
+                    let _ = ctx.profiler.gates.apply_update(&update);
+                }
             }
         }
 
@@ -867,6 +1008,7 @@ where
     }
 
     ctx.reclaim_all_ncclops_in_map();
+    ctx.flush_p2p_parents();
 
     exporter.export(ctx, Some(RETRY_MS));
 }

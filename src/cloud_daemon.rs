@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::net::UnixStream;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -87,6 +88,9 @@ impl Telemetry {
             }
             Telemetry::NcclOp(ncclop) => {
                 writeln!(buf, "{}", ncclop.trace_record(&mut time_to_num))?;
+            }
+            Telemetry::P2pParent(parent) => {
+                writeln!(buf, "{}", parent.trace_record(&mut time_to_num))?;
             }
             Telemetry::ProxyOp(proxyop) => {
                 writeln!(buf, "{}", proxyop.trace_record(&mut time_to_num))?;
@@ -334,6 +338,20 @@ async fn build_bufwriter(
     }
 }
 
+async fn connect_latency_sock(path: impl AsRef<std::path::Path>) -> Option<UnixStream> {
+    match UnixStream::connect(&path).await {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            error!(
+                "Failed to connect latency telemetry socket {:?}: {}.",
+                path.as_ref().as_os_str(),
+                e
+            );
+            None
+        }
+    }
+}
+
 async fn exporter(
     profiler: &'static Profiler,
     mut rx: mpsc::Receiver<Telemetry>,
@@ -345,6 +363,18 @@ async fn exporter(
     } else {
         None
     };
+
+    let latency_sock_path = profiler
+        .config
+        .latency_sock
+        .as_ref()
+        .map(|template| template.replace("%p", &format!("{}", profiler.pid)));
+    let mut latency_sock = if let Some(path) = latency_sock_path.as_ref() {
+        connect_latency_sock(path).await
+    } else {
+        None
+    };
+    let mut next_latency_sock_retry = Instant::now();
 
     let mut summary_file = if let Some(template) = profiler.config.summary_file.as_ref() {
         let path = template.replace("%p", &format!("{}", profiler.pid));
@@ -386,6 +416,16 @@ async fn exporter(
     let mut uploader_interval = tokio::time::interval(profiler.config.heartbeat_upload_interval);
     uploader_interval.tick().await;
 
+    // Periodic latency-file flush for online consumers (straggler monitor).
+    let mut latency_flush_interval =
+        if profiler.config.latency_flush_interval > Duration::from_secs(0) {
+            let mut i = tokio::time::interval(profiler.config.latency_flush_interval);
+            i.tick().await;
+            Some(i)
+        } else {
+            None
+        };
+
     let mut otel_metrics_grouping_interval = if profiler.config.otel_enable {
         let mut i =
             tokio::time::interval(profiler.config.otel_metrics_cardinality_grouping_interval);
@@ -409,6 +449,30 @@ async fn exporter(
                             if let Err(e) = r {
                                 error!("Failed to log latency telemetry to file: {}. Stop logging.", e);
                                 latency_file = None;
+                            }
+                        }
+
+                        if latency_sock.is_none() {
+                            if let Some(path) = latency_sock_path.as_ref() {
+                                if Instant::now() >= next_latency_sock_retry {
+                                    latency_sock = connect_latency_sock(path).await;
+                                    if latency_sock.is_none() {
+                                        next_latency_sock_retry = Instant::now() + Duration::from_secs(1);
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(stream) = latency_sock.as_mut() {
+                            let r = telemetry
+                                .write_to_file(
+                                    stream,
+                                    |t| profiler.instant_to_timestamp(t).as_micros() as _)
+                                .await;
+                            if let Err(e) = r {
+                                error!("Failed to stream latency telemetry to socket: {}. Will retry.", e);
+                                latency_sock = None;
+                                next_latency_sock_retry = Instant::now() + Duration::from_secs(1);
                             }
                         }
 
@@ -451,6 +515,15 @@ async fn exporter(
                         }
                     },
                     None => break,
+                }
+            },
+            _ = async { latency_flush_interval.as_mut().unwrap().tick().await },
+                    if latency_flush_interval.is_some() && latency_file.is_some() => {
+                if let Some(file) = latency_file.as_mut() {
+                    if let Err(e) = file.flush().await {
+                        error!("Failed to flush latency telemetry file: {}. Stop logging.", e);
+                        latency_file = None;
+                    }
                 }
             },
             _ = summary_interval.tick(), if summary.is_some() => {
