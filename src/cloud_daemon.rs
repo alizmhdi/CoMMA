@@ -481,6 +481,11 @@ async fn exporter(
                                 Telemetry::NcclOp(op) => {
                                     summary.add_op(op);
                                 },
+                                Telemetry::P2pParent(parent) => {
+                                    for op in &parent.children {
+                                        summary.add_op(op);
+                                    }
+                                },
                                 Telemetry::NcclOpIssued(op) => {
                                     summary.record_op_issue(op);
                                 },
@@ -495,16 +500,34 @@ async fn exporter(
                         }
 
                         if let Some(gpuviz) = gpuviz.as_mut() {
-                            if let Telemetry::NcclOp(op) = &telemetry {
-                                let _ = gpuviz.add_ncclop(op, |t| {
-                                    profiler.instant_to_timestamp(*t).as_nanos() as _
-                                });
+                            match &telemetry {
+                                Telemetry::NcclOp(op) => {
+                                    let _ = gpuviz.add_ncclop(op, |t| {
+                                        profiler.instant_to_timestamp(*t).as_nanos() as _
+                                    });
+                                }
+                                Telemetry::P2pParent(parent) => {
+                                    for op in &parent.children {
+                                        let _ = gpuviz.add_ncclop(op, |t| {
+                                            profiler.instant_to_timestamp(*t).as_nanos() as _
+                                        });
+                                    }
+                                }
+                                _ => {}
                             }
                         }
 
                         if let Some(otel_tracer) = otel_tracer.as_mut() {
-                            if let Telemetry::NcclOp(op) = &telemetry {
-                                let _ = otel_utils::add_ncclop_trace(otel_tracer, profiler, op);
+                            match &telemetry {
+                                Telemetry::NcclOp(op) => {
+                                    let _ = otel_utils::add_ncclop_trace(otel_tracer, profiler, op);
+                                }
+                                Telemetry::P2pParent(parent) => {
+                                    for op in &parent.children {
+                                        let _ = otel_utils::add_ncclop_trace(otel_tracer, profiler, op);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
 

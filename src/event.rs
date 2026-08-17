@@ -132,9 +132,13 @@ impl Group {
     }
 }
 
-/// Parent covering every P2P send/recv in one NCCL group.
-/// Emitted as `cat: P2P_GROUP` (not COLL) when a group contains 2+ P2Ps
-/// and no native collective. `name` is `all_to_all` or `sendrecv`.
+/// One communication operation covering every P2P send/recv in an NCCL group.
+///
+/// Emitted as a single top-level `cat: P2P_GROUP` line with child send/recv
+/// nested under `p2ps` (same shape as COLL nesting `proxyops`). `name` is
+/// `all_to_all` (≥2 peers), `sendrecv` (1 peer, both directions), or
+/// `send`/`recv` (one child). Incomplete groups flushed on timeout/shutdown
+/// set `partial`.
 #[derive(Debug, Clone)]
 pub struct P2pParent {
     pub group_id: u64,
@@ -146,6 +150,8 @@ pub struct P2pParent {
     pub n_children: usize,
     pub n_peers: usize,
     pub name: &'static str,
+    pub children: Vec<NcclOp>,
+    pub partial: bool,
 }
 
 impl P2pParent {
@@ -153,7 +159,7 @@ impl P2pParent {
     where
         F: FnMut(Instant) -> u64,
     {
-        json!({
+        let mut rec = json!({
             "ph": "X",
             "ts": time_to_num(self.start_time),
             "dur": (self.end_time.saturating_duration_since(self.start_time)).as_micros(),
@@ -167,7 +173,18 @@ impl P2pParent {
             "args": {
                 "size": self.size,
             },
-        })
+        });
+        if self.partial {
+            rec["partial"] = json!(true);
+        }
+        if !self.children.is_empty() {
+            rec["p2ps"] = self
+                .children
+                .iter()
+                .map(|c| c.trace_record(&mut time_to_num))
+                .collect();
+        }
+        rec
     }
 }
 
@@ -823,6 +840,8 @@ mod tests {
             n_children: 6,
             n_peers: 3,
             name: "all_to_all",
+            children: Vec::new(),
+            partial: false,
         };
         let rec = parent.trace_record(|_| 42);
         assert_eq!(rec["cat"], "P2P_GROUP");
@@ -833,5 +852,7 @@ mod tests {
         assert_eq!(rec["comm_hash"], "0x0000000000000abc");
         assert_eq!(rec["args"]["size"], 4096);
         assert_eq!(rec["dur"], 250);
+        assert!(rec.get("p2ps").is_none());
+        assert!(rec.get("partial").is_none());
     }
 }

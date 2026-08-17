@@ -180,25 +180,13 @@ pub enum Telemetry {
     CommClose(/* comm_hash = */ u64),
 }
 
-/// Accumulator for P2Ps (and optional COLLs) that share one NCCL Group.
+/// Accumulator for P2Ps that share one NCCL Group. Native COLLs in the same
+/// group are emitted on their own; P2Ps wait here and nest under P2P_GROUP.
 #[derive(Default)]
 struct P2pGroupAcc {
     expected: usize,
-    completed: usize,
     ended: bool,
-    has_coll: bool,
-    min_start: Option<Instant>,
-    max_end: Option<Instant>,
-    send_bytes: usize,
-    peers: HashSet<i32>,
-    comm_hash: u64,
-    rank: usize,
-}
-
-impl P2pGroupAcc {
-    fn will_emit_parent(&self) -> bool {
-        self.ended && !self.has_coll && self.expected >= 2
-    }
+    children: Vec<Box<event::NcclOp>>,
 }
 
 pub struct PollingContext<'a> {
@@ -233,101 +221,121 @@ impl<'a> PollingContext<'a> {
     }
 
     fn note_ncclop_start(&mut self, op: &event::NcclOp) {
+        if !op.is_p2p() {
+            return;
+        }
         let Some(gid) = op.parent_group_id() else {
             return;
         };
-        let g = self.p2p_groups.entry(gid).or_default();
-        if op.is_p2p() {
-            g.expected += 1;
-        } else {
-            g.has_coll = true;
-        }
+        self.p2p_groups.entry(gid).or_default().expected += 1;
     }
 
-    fn record_p2p_completion(&mut self, op: &event::NcclOp) {
-        let Some(gid) = op.parent_group_id() else {
-            return;
+    fn group_has_inflight(&self, gid: u64) -> bool {
+        self.ncclops
+            .values()
+            .any(|op| op.is_p2p() && op.parent_group_id() == Some(gid))
+    }
+
+    fn try_emit_p2p_parent(&mut self, gid: u64, force: bool) {
+        let (n_children, ended, expected) = match self.p2p_groups.get(&gid) {
+            Some(g) => (g.children.len(), g.ended, g.expected),
+            None => return,
         };
-        let g = self.p2p_groups.entry(gid).or_default();
-        g.completed += 1;
-        let start = op.basic_info().start_time();
-        g.min_start = Some(g.min_start.map_or(start, |t| t.min(start)));
-        if let Some(end) = op.basic_info().end_time() {
-            g.max_end = Some(g.max_end.map_or(end, |t| t.max(end)));
-        }
-        g.comm_hash = op.comm_hash();
-        g.rank = op.basic_info().rank();
-        if let Some(p2p) = op.get_descr().try_cast_to_p2p() {
-            g.peers.insert(p2p.peer());
-            if p2p.is_send() {
-                g.send_bytes = g.send_bytes.saturating_add(op.byte_count());
-            }
-        }
-    }
-
-    fn will_emit_parent(&self, gid: u64) -> bool {
-        self.p2p_groups
-            .get(&gid)
-            .map(P2pGroupAcc::will_emit_parent)
-            .unwrap_or(false)
-    }
-
-    fn try_emit_p2p_parent(&mut self, gid: u64) {
-        let Some(g) = self.p2p_groups.get(&gid) else {
-            return;
-        };
-        if !(g.will_emit_parent() && g.completed == g.expected) {
+        let ready = n_children > 0
+            && (force || (ended && n_children >= expected && !self.group_has_inflight(gid)));
+        if !ready {
             return;
         }
         let g = self.p2p_groups.remove(&gid).unwrap();
-        let start = g.min_start.unwrap_or_else(Instant::now);
-        let end = g.max_end.unwrap_or(start);
-        let name = if g.peers.len() >= 2 {
+        let partial = force && (g.children.len() < g.expected || !g.ended);
+        self.emit_p2p_group(gid, g.children, partial);
+    }
+
+    fn emit_p2p_group(&mut self, gid: u64, children: Vec<Box<event::NcclOp>>, partial: bool) {
+        let mut children: Vec<event::NcclOp> = children.into_iter().map(|b| *b).collect();
+        children.sort_by_key(|c| (c.basic_info().start_time(), c.id()));
+        for c in &mut children {
+            c.clear_parent_group_id();
+        }
+        let start = children
+            .iter()
+            .map(|c| c.basic_info().start_time())
+            .min()
+            .unwrap_or_else(Instant::now);
+        let end = children
+            .iter()
+            .filter_map(|c| c.basic_info().end_time())
+            .max()
+            .unwrap_or(start);
+        let mut peers = HashSet::new();
+        let mut n_send = 0usize;
+        let mut n_recv = 0usize;
+        let mut send_bytes = 0usize;
+        for c in &children {
+            if let Some(p2p) = c.get_descr().try_cast_to_p2p() {
+                peers.insert(p2p.peer());
+                if p2p.is_send() {
+                    n_send += 1;
+                    send_bytes = send_bytes.saturating_add(c.byte_count());
+                } else {
+                    n_recv += 1;
+                }
+            }
+        }
+        let name = if peers.len() >= 2 {
             "all_to_all"
-        } else {
+        } else if n_send > 0 && n_recv > 0 {
             "sendrecv"
+        } else if n_send > 0 {
+            "send"
+        } else {
+            "recv"
         };
+        let rank = children.first().map(|c| c.basic_info().rank()).unwrap_or(0);
+        let comm_hash = children.first().map(|c| c.comm_hash()).unwrap_or(0);
         self.pending_telemetry
             .push_back(Telemetry::P2pParent(Box::new(event::P2pParent {
                 group_id: gid,
-                rank: g.rank,
-                comm_hash: g.comm_hash,
+                rank,
+                comm_hash,
                 start_time: start,
                 end_time: if end > start { end } else { start },
-                size: g.send_bytes,
-                n_children: g.completed,
-                n_peers: g.peers.len(),
+                size: send_bytes,
+                n_children: children.len(),
+                n_peers: peers.len(),
                 name,
+                children,
+                partial,
             })));
     }
 
     fn flush_p2p_parents(&mut self) {
         let gids: Vec<u64> = self.p2p_groups.keys().copied().collect();
         for gid in gids {
-            if let Some(g) = self.p2p_groups.get_mut(&gid) {
-                if g.ended && !g.has_coll && g.completed >= 2 {
-                    g.expected = g.completed;
-                }
-            }
-            self.try_emit_p2p_parent(gid);
+            self.try_emit_p2p_parent(gid, true);
         }
     }
 
     fn reclaim_ncclop(&mut self, mut op: event::NcclOp) {
-        if let Some(gid) = op.parent_group_id() {
-            if op.is_p2p() {
-                self.record_p2p_completion(&op);
-                if !self.will_emit_parent(gid) {
-                    op.clear_parent_group_id();
-                }
-                self.pending_telemetry
-                    .push_back(Telemetry::NcclOp(Box::new(op)));
-                self.try_emit_p2p_parent(gid);
-                return;
+        if !op.is_p2p() {
+            self.pending_telemetry
+                .push_back(Telemetry::NcclOp(Box::new(op)));
+            return;
+        }
+        match op.parent_group_id() {
+            Some(gid) => {
+                self.p2p_groups
+                    .entry(gid)
+                    .or_default()
+                    .children
+                    .push(Box::new(op));
+                self.try_emit_p2p_parent(gid, false);
+            }
+            None => {
+                op.clear_parent_group_id();
+                self.emit_p2p_group(0, vec![Box::new(op)], false);
             }
         }
-        self.pending_telemetry
-            .push_back(Telemetry::NcclOp(Box::new(op)));
     }
 
     fn get_ncclop(&mut self, id: usize) -> Option<&mut event::NcclOp> {
@@ -563,7 +571,7 @@ impl<'a> PollingContext<'a> {
             Message::Group(group) => {
                 let gid = group.id();
                 self.p2p_groups.entry(gid).or_default().ended = true;
-                self.try_emit_p2p_parent(gid);
+                self.try_emit_p2p_parent(gid, false);
                 if self.profiler.config.track_group {
                     self.pending_telemetry.push_back(Telemetry::Group(group));
                 }
