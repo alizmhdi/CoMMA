@@ -22,7 +22,9 @@ use crate::event_ffi::AsFFI as _;
 use crate::gpuviz;
 use crate::nccl_metadata;
 use crate::nccl_metadata::ProxyOp;
-use crate::nccl_metadata::{Coll as _, Event as _, KernelStep as _, NcclOp as _, P2p as _, ProxyStep as _};
+use crate::nccl_metadata::{
+    Coll as _, Event as _, KernelStep as _, NcclOp as _, P2p as _, ProxyStep as _,
+};
 use crate::profiler_shim;
 use crate::runtime_gates::RuntimeGates;
 use crate::slab;
@@ -32,9 +34,11 @@ use crate::NcclResult;
 
 use crossbeam::queue::ArrayQueue;
 use rand::{rngs::SmallRng, RngCore as _, SeedableRng as _};
+use serde_json::json;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -349,6 +353,187 @@ impl Communicator {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CommMember {
+    pub rank: i32,
+    pub world_rank: i32,
+    pub node: i32,
+    pub cuda_dev: i32,
+    pub host_hash: u64,
+    pub bus_id: i64,
+}
+
+/// Full NCCL communicator membership, dumped once after init completes.
+#[derive(Debug, Clone)]
+pub struct CommMembership {
+    pub comm_hash: u64,
+    pub comm_name: String,
+    pub n_nodes: i32,
+    pub n_ranks: i32,
+    pub rank: i32,
+    pub world_rank: i32,
+    pub host: String,
+    pub ip: String,
+    pub members: Vec<CommMember>,
+    pub ts: Instant,
+}
+
+impl CommMembership {
+    pub fn trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        json!({
+            "cat": "COMM_INIT",
+            "name": self.comm_name,
+            "ts": time_to_num(self.ts),
+            "dur": 0,
+            "rank": self.rank,
+            "world_rank": self.world_rank,
+            "comm_hash": format!("0x{:x}", self.comm_hash),
+            "n_nodes": self.n_nodes,
+            "n_ranks": self.n_ranks,
+            "host": self.host,
+            "ip": self.ip,
+            "members": self.members.iter().map(|m| json!({
+                "rank": m.rank,
+                "world_rank": m.world_rank,
+                "node": m.node,
+                "cuda_dev": m.cuda_dev,
+                "host_hash": format!("0x{:x}", m.host_hash),
+                "bus_id": m.bus_id,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+fn process_hostname() -> String {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return "unknown".into();
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+fn ipv4_matching_iface(want: &str) -> Option<String> {
+    unsafe {
+        let mut ifa: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifa) != 0 {
+            return None;
+        }
+        let mut cur = ifa;
+        let mut fallback = None;
+        while !cur.is_null() {
+            let a = &*cur;
+            if !a.ifa_addr.is_null()
+                && (*a.ifa_addr).sa_family == libc::AF_INET as libc::sa_family_t
+            {
+                let name = std::ffi::CStr::from_ptr(a.ifa_name).to_string_lossy();
+                let sin = &*(a.ifa_addr as *const libc::sockaddr_in);
+                let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                if !ip.is_loopback() {
+                    if want.is_empty() || name == want || name.starts_with(want) {
+                        libc::freeifaddrs(ifa);
+                        return Some(ip.to_string());
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(ip.to_string());
+                    }
+                }
+            }
+            cur = a.ifa_next;
+        }
+        libc::freeifaddrs(ifa);
+        fallback
+    }
+}
+
+fn process_ipv4() -> String {
+    if let Ok(name) = std::env::var("NCCL_SOCKET_IFNAME") {
+        let name = name.trim();
+        if !name.is_empty() {
+            if let Some(ip) = ipv4_matching_iface(name) {
+                return ip;
+            }
+        }
+    }
+    ipv4_matching_iface("").unwrap_or_else(|| "0.0.0.0".into())
+}
+
+/// Called from NCCL after communicator init completes, with the full
+/// `peerInfo` / `topParentRanks` tables.
+pub fn dump_comm_membership(
+    comm_hash: u64,
+    comm_name: *const libc::c_char,
+    n_nodes: i32,
+    n_ranks: i32,
+    rank: i32,
+    top_parent_ranks: *const i32,
+    rank_to_node: *const i32,
+    host_hashes: *const u64,
+    cuda_devs: *const i32,
+    bus_ids: *const i64,
+) {
+    if config::CONFIG.telemetry_mode == 0 || PROFILER.get().is_none() {
+        return;
+    }
+    if n_ranks <= 0 || rank < 0 || rank >= n_ranks {
+        return;
+    }
+    if top_parent_ranks.is_null() || host_hashes.is_null() || cuda_devs.is_null() {
+        return;
+    }
+    let comm_name = if comm_name.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(comm_name) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let mut members = Vec::with_capacity(n_ranks as usize);
+    for i in 0..n_ranks {
+        let world = unsafe { *top_parent_ranks.add(i as usize) };
+        let node = if rank_to_node.is_null() {
+            -1
+        } else {
+            unsafe { *rank_to_node.add(i as usize) }
+        };
+        let host_hash = unsafe { *host_hashes.add(i as usize) };
+        let cuda_dev = unsafe { *cuda_devs.add(i as usize) };
+        let bus_id = if bus_ids.is_null() {
+            0
+        } else {
+            unsafe { *bus_ids.add(i as usize) }
+        };
+        members.push(CommMember {
+            rank: i,
+            world_rank: world,
+            node,
+            cuda_dev,
+            host_hash,
+            bus_id,
+        });
+    }
+    let world_rank = members[rank as usize].world_rank;
+    let membership = CommMembership {
+        comm_hash,
+        comm_name,
+        n_nodes,
+        n_ranks,
+        rank,
+        world_rank,
+        host: process_hostname(),
+        ip: process_ipv4(),
+        members,
+        ts: Instant::now(),
+    };
+    with_thread_state(|thread_state| {
+        thread_state.send_to_daemon(daemon::Message::CommInit(membership), true);
+    });
+}
+
 #[derive(Debug)]
 #[repr(align(16))]
 pub struct KernelCh {
@@ -361,6 +546,7 @@ pub struct KernelStepLocal {
     pub parent_op: Option<usize>,
     pub channel_id: u8,
     pub is_send: bool,
+    /// Communicator-local dest rank. NCCL only exports same-host KernelSteps.
     pub peer: u8,
     pub step: u32,
     pub size: u32,
@@ -531,9 +717,13 @@ where
     let gates = PROFILER.get().map(|p| &p.gates);
     let event = match descr.type_() as u32 {
         profiler_shim::ncclProfileGroup => {
-            let track_ncclop = gates.map(|g| g.track_ncclop()).unwrap_or(config.track_ncclop);
+            let track_ncclop = gates
+                .map(|g| g.track_ncclop())
+                .unwrap_or(config.track_ncclop);
             let track_group = gates.map(|g| g.track_group()).unwrap_or(config.track_group);
-            let track_proxyop = gates.map(|g| g.track_proxyop()).unwrap_or(config.track_proxyop);
+            let track_proxyop = gates
+                .map(|g| g.track_proxyop())
+                .unwrap_or(config.track_proxyop);
             if track_ncclop || track_group {
                 Some(event::Event::new_group(descr, Instant::now()))
             } else if track_proxyop {
@@ -549,8 +739,12 @@ where
             let comm = unsafe { &*comm };
             let byte_count = descr.byte_count();
             let op_type = descr.op_type();
-            let track_ncclop = gates.map(|g| g.track_ncclop()).unwrap_or(config.track_ncclop);
-            let track_proxyop = gates.map(|g| g.track_proxyop()).unwrap_or(config.track_proxyop);
+            let track_ncclop = gates
+                .map(|g| g.track_ncclop())
+                .unwrap_or(config.track_ncclop);
+            let track_proxyop = gates
+                .map(|g| g.track_proxyop())
+                .unwrap_or(config.track_proxyop);
             if track_ncclop {
                 use nccl_metadata::NcclOpType;
                 let track_steps = gates
@@ -626,9 +820,12 @@ where
             let descr = unsafe { descr.cast_to_p2p() };
             // SAFETY: for coll and p2p, NCCL guarantees the comm pointer is valid
             let comm = unsafe { &*comm };
-            // AllToAll/self-copy emits peer==rank P2P with no GPU KernelStep path.
-            // Drop those no-ops so strict coverage validators see only real send/recv.
+            // AllToAll self-copy (peer==rank) is a local memcpy, not a CO.
+            // Do not emit a child P2P — that delayed P2P_GROUP completion and
+            // broke live period lock. Stamp the byte count on the parent Group
+            // so P2P_GROUP.args.self_copy_size is the tokens this rank keeps.
             if descr.peer() == descr.rank() {
+                event_ffi::record_group_self_copy_size(descr.parent_obj(), descr.byte_count());
                 return Ok(None);
             }
             let should_sample = with_thread_state(|thread_state| {
@@ -828,37 +1025,44 @@ where
                 None
             } else {
                 let descr = unsafe { descr.cast_to_kernelstep() };
-                let parent_ffi = descr.parent_obj();
-                let parent_type = event_ffi::get_handle_type(parent_ffi);
-                if parent_ffi.is_null() || parent_type == event_ffi::Type::SmallNcclOp {
+                let track_recv_ks = gates
+                    .map(|g| g.track_recv_kernel_step())
+                    .unwrap_or(config.track_recv_kernel_step);
+                if !descr.is_send() && !track_recv_ks {
                     None
                 } else {
-                    let parent = event_ffi::ProxyParent::from_ffi(parent_ffi);
-                    if let event_ffi::ProxyParent::NcclOp(ncclop) = parent {
-                        with_thread_state(|thread_state| {
-                            thread_state.inc_ncclop_ref(thread_state.profiler.pid, ncclop);
-                            let step = thread_state
-                                .kernelstep_free_list
-                                .alloc_new(
-                                    KernelStepLocal {
-                                        parent_op: Some(ncclop),
-                                        channel_id: descr.channel_id(),
-                                        is_send: descr.is_send(),
-                                        peer: descr.peer(),
-                                        step: descr.step(),
-                                        size: descr.size(),
-                                        start_ts: descr.start_ts(),
-                                        ready_ts: descr.ready_ts(),
-                                        end_ts: None,
-                                    },
-                                    None,
-                                    true,
-                                )
-                                .unwrap();
-                            Some(event::Event::KernelStep(step))
-                        })
-                    } else {
+                    let parent_ffi = descr.parent_obj();
+                    let parent_type = event_ffi::get_handle_type(parent_ffi);
+                    if parent_ffi.is_null() || parent_type == event_ffi::Type::SmallNcclOp {
                         None
+                    } else {
+                        let parent = event_ffi::ProxyParent::from_ffi(parent_ffi);
+                        if let event_ffi::ProxyParent::NcclOp(ncclop) = parent {
+                            with_thread_state(|thread_state| {
+                                thread_state.inc_ncclop_ref(thread_state.profiler.pid, ncclop);
+                                let step = thread_state
+                                    .kernelstep_free_list
+                                    .alloc_new(
+                                        KernelStepLocal {
+                                            parent_op: Some(ncclop),
+                                            channel_id: descr.channel_id(),
+                                            is_send: descr.is_send(),
+                                            peer: descr.peer(),
+                                            step: descr.step(),
+                                            size: descr.size(),
+                                            start_ts: descr.start_ts(),
+                                            ready_ts: descr.ready_ts(),
+                                            end_ts: None,
+                                        },
+                                        None,
+                                        true,
+                                    )
+                                    .unwrap();
+                                Some(event::Event::KernelStep(step))
+                            })
+                        } else {
+                            None
+                        }
                     }
                 }
             }
@@ -1099,4 +1303,48 @@ pub fn finalize_handler(comm: Box<Communicator>) -> NcclResult<()> {
         *lg -= 1;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comm_membership_json_has_full_table() {
+        let rec = CommMembership {
+            comm_hash: 0xabc,
+            comm_name: "tp".into(),
+            n_nodes: 2,
+            n_ranks: 2,
+            rank: 0,
+            world_rank: 1,
+            host: "sgpu9".into(),
+            ip: "10.0.0.4".into(),
+            members: vec![
+                CommMember {
+                    rank: 0,
+                    world_rank: 1,
+                    node: 0,
+                    cuda_dev: 0,
+                    host_hash: 0x9,
+                    bus_id: 0,
+                },
+                CommMember {
+                    rank: 1,
+                    world_rank: 3,
+                    node: 1,
+                    cuda_dev: 0,
+                    host_hash: 0x8,
+                    bus_id: 0,
+                },
+            ],
+            ts: Instant::now(),
+        }
+        .trace_record(|_| 42);
+        assert_eq!(rec["cat"], "COMM_INIT");
+        assert_eq!(rec["world_rank"], 1);
+        assert_eq!(rec["members"].as_array().unwrap().len(), 2);
+        assert_eq!(rec["members"][1]["world_rank"], 3);
+        assert_eq!(rec["comm_hash"], "0xabc");
+    }
 }

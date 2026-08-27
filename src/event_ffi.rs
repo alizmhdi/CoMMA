@@ -104,6 +104,24 @@ pub fn peek_group_id(handle: Handle) -> Option<u64> {
     }
 }
 
+/// Record AllToAll self-copy bytes on the live parent Group. Send-to-self and
+/// recv-from-self are the same memcpy; `Group` keeps the max, not the sum.
+/// No-op when `handle` is not a Group or `bytes` is 0.
+pub fn record_group_self_copy_size(handle: Handle, bytes: usize) {
+    if bytes == 0 || handle.is_null() || get_handle_type(handle) != Type::Group {
+        return;
+    }
+    let ptr = get_handle_inner(handle) as *const Group;
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: same as peek_group_id — Group is live until Group stop, and
+    // P2P start (including self-copy) runs before that.
+    unsafe {
+        (*ptr).record_self_copy_size(bytes);
+    }
+}
+
 pub trait AsFFI: Sized {
     fn into_ffi(self) -> Handle;
 
@@ -334,8 +352,15 @@ mod tests {
         let want = group.id();
         let handle = Event::into_ffi(event);
         assert_eq!(peek_group_id(handle), Some(want));
-        // SAFETY: handle came from into_ffi in this test.
-        let _ = unsafe { Event::from_ffi(handle) };
+        record_group_self_copy_size(handle, 100);
+        record_group_self_copy_size(handle, 257_536); // recv; max, not sum
+        record_group_self_copy_size(handle, 257_536); // send
+                                                      // SAFETY: handle came from into_ffi in this test.
+        let restored = unsafe { Event::from_ffi(handle) };
+        let Event::Group(group) = restored.expect("group") else {
+            panic!("expected Group");
+        };
+        assert_eq!(group.self_copy_size(), 257_536);
     }
 
     #[test]

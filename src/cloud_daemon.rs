@@ -95,6 +95,9 @@ impl Telemetry {
             Telemetry::ProxyOp(proxyop) => {
                 writeln!(buf, "{}", proxyop.trace_record(&mut time_to_num))?;
             }
+            Telemetry::CommInit(membership) => {
+                writeln!(buf, "{}", membership.trace_record(&mut time_to_num))?;
+            }
             _ => {}
         }
         file.write_all(&buf).await

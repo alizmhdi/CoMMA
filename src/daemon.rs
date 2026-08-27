@@ -146,6 +146,7 @@ pub enum Message {
     ),
     KernelStep(event::KernelEventStep, /* parent handle */ usize),
     CommOpen(Communicator),
+    CommInit(crate::profiler::CommMembership),
     CommClose(/* comm_hash = */ u64),
 }
 
@@ -177,6 +178,7 @@ pub enum Telemetry {
     P2pParent(Box<event::P2pParent>),
     ProxyOp(Box<event::ProxyOp>),
     CommOpen(Communicator),
+    CommInit(crate::profiler::CommMembership),
     CommClose(/* comm_hash = */ u64),
 }
 
@@ -187,6 +189,7 @@ struct P2pGroupAcc {
     expected: usize,
     ended: bool,
     children: Vec<Box<event::NcclOp>>,
+    self_copy_size: usize,
 }
 
 pub struct PollingContext<'a> {
@@ -248,10 +251,16 @@ impl<'a> PollingContext<'a> {
         }
         let g = self.p2p_groups.remove(&gid).unwrap();
         let partial = force && (g.children.len() < g.expected || !g.ended);
-        self.emit_p2p_group(gid, g.children, partial);
+        self.emit_p2p_group(gid, g.children, partial, g.self_copy_size);
     }
 
-    fn emit_p2p_group(&mut self, gid: u64, children: Vec<Box<event::NcclOp>>, partial: bool) {
+    fn emit_p2p_group(
+        &mut self,
+        gid: u64,
+        children: Vec<Box<event::NcclOp>>,
+        partial: bool,
+        self_copy_size: usize,
+    ) {
         let mut children: Vec<event::NcclOp> = children.into_iter().map(|b| *b).collect();
         children.sort_by_key(|c| (c.basic_info().start_time(), c.id()));
         for c in &mut children {
@@ -306,6 +315,7 @@ impl<'a> PollingContext<'a> {
                 name,
                 children,
                 partial,
+                self_copy_size,
             })));
     }
 
@@ -333,7 +343,7 @@ impl<'a> PollingContext<'a> {
             }
             None => {
                 op.clear_parent_group_id();
-                self.emit_p2p_group(0, vec![Box::new(op)], false);
+                self.emit_p2p_group(0, vec![Box::new(op)], false, 0);
             }
         }
     }
@@ -570,7 +580,9 @@ impl<'a> PollingContext<'a> {
         match msg {
             Message::Group(group) => {
                 let gid = group.id();
-                self.p2p_groups.entry(gid).or_default().ended = true;
+                let acc = self.p2p_groups.entry(gid).or_default();
+                acc.ended = true;
+                acc.self_copy_size = acc.self_copy_size.max(group.self_copy_size());
                 self.try_emit_p2p_parent(gid, false);
                 if self.profiler.config.track_group {
                     self.pending_telemetry.push_back(Telemetry::Group(group));
@@ -697,6 +709,10 @@ impl<'a> PollingContext<'a> {
             }
             Message::CommOpen(comm) => {
                 self.pending_telemetry.push_back(Telemetry::CommOpen(comm));
+            }
+            Message::CommInit(membership) => {
+                self.pending_telemetry
+                    .push_back(Telemetry::CommInit(membership));
             }
             Message::CommClose(comm_hash) => {
                 self.pending_telemetry

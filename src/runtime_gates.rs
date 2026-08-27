@@ -44,6 +44,7 @@ pub struct RuntimeGates {
     aggregate_steps: AtomicBool,
     track_kernel_ch: AtomicBool,
     track_kernel_step: AtomicBool,
+    track_recv_kernel_step: AtomicBool,
     api_v6: AtomicBool,
     /// Points at NCCL `ncclProfilerEventMask` (same address every `init`).
     event_mask: AtomicPtr<i32>,
@@ -62,6 +63,7 @@ impl RuntimeGates {
             aggregate_steps: AtomicBool::new(config.aggregate_steps),
             track_kernel_ch: AtomicBool::new(config.track_kernel_ch),
             track_kernel_step: AtomicBool::new(config.track_kernel_step),
+            track_recv_kernel_step: AtomicBool::new(config.track_recv_kernel_step),
             api_v6: AtomicBool::new(matches!(version, Version::V6)),
             event_mask: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -97,6 +99,9 @@ impl RuntimeGates {
     pub fn track_kernel_step(&self) -> bool {
         self.track_kernel_step.load(Ordering::Acquire)
     }
+    pub fn track_recv_kernel_step(&self) -> bool {
+        self.track_recv_kernel_step.load(Ordering::Acquire)
+    }
 
     pub fn proxy_step_enabled(&self) -> bool {
         self.track_steps() || self.aggregate_steps()
@@ -114,6 +119,7 @@ impl RuntimeGates {
             aggregate_steps: self.aggregate_steps(),
             track_kernel_ch: self.track_kernel_ch(),
             track_kernel_step: self.track_kernel_step(),
+            track_recv_kernel_step: self.track_recv_kernel_step(),
             mask: self.compute_mask(),
         }
     }
@@ -178,13 +184,17 @@ impl RuntimeGates {
         changed |= swap_bool(&self.track_group, update.track_group);
         changed |= swap_bool(&self.track_ncclop, update.track_ncclop);
         changed |= swap_bool(&self.track_proxyop, update.track_proxyop);
-        changed |= swap_bool(&self.track_interprocess_proxyop, update.track_interprocess_proxyop);
+        changed |= swap_bool(
+            &self.track_interprocess_proxyop,
+            update.track_interprocess_proxyop,
+        );
         changed |= swap_bool(&self.track_steps, update.track_steps);
         changed |= swap_bool(&self.track_recv_steps, update.track_recv_steps);
         changed |= swap_bool(&self.track_step_fifo_wait, update.track_step_fifo_wait);
         changed |= swap_bool(&self.aggregate_steps, update.aggregate_steps);
         changed |= swap_bool(&self.track_kernel_ch, update.track_kernel_ch);
         changed |= swap_bool(&self.track_kernel_step, update.track_kernel_step);
+        changed |= swap_bool(&self.track_recv_kernel_step, update.track_recv_kernel_step);
         if changed {
             let mask = self.publish_mask();
             info!(
@@ -226,6 +236,8 @@ pub struct GateUpdate {
     pub track_kernel_ch: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track_kernel_step: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_recv_kernel_step: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +252,7 @@ pub struct GateSnapshot {
     pub aggregate_steps: bool,
     pub track_kernel_ch: bool,
     pub track_kernel_step: bool,
+    pub track_recv_kernel_step: bool,
     pub mask: i32,
 }
 
@@ -251,11 +264,13 @@ mod tests {
     fn gate_update_json_roundtrip() {
         let u = GateUpdate {
             track_kernel_step: Some(false),
+            track_recv_kernel_step: Some(true),
             track_steps: Some(true),
             ..Default::default()
         };
         let s = serde_json::to_string(&u).unwrap();
         let back: GateUpdate = serde_json::from_str(&s).unwrap();
         assert_eq!(back, u);
+        assert!(s.contains("track_recv_kernel_step"));
     }
 }

@@ -746,7 +746,7 @@ pub trait ProxyStep: Event {
     fn step(&self) -> i32;
 }
 
-/// Per-slice Simple-prims kernel step (profiler API v6+).
+/// Per-slice kernel step (profiler API v6+). `peer()` is communicator-local dest rank.
 pub trait KernelStep: Event {
     fn channel_id(&self) -> u8;
     fn is_send(&self) -> bool;

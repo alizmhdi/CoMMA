@@ -198,6 +198,38 @@ unsafe extern "C" fn profiler_init_v4(
     }
 }
 
+/// NCCL calls this after communicator init completes, with the full
+/// peer table (`topParentRanks`, `peerInfo.hostHash`, …).
+///
+/// # Safety
+/// Pointers must be valid for `n_ranks` elements (or null where allowed).
+#[no_mangle]
+pub unsafe extern "C" fn comma_dump_comm_membership(
+    comm_hash: u64,
+    comm_name: *const libc::c_char,
+    n_nodes: i32,
+    n_ranks: i32,
+    rank: i32,
+    top_parent_ranks: *const i32,
+    rank_to_node: *const i32,
+    host_hashes: *const u64,
+    cuda_devs: *const i32,
+    bus_ids: *const i64,
+) {
+    profiler::dump_comm_membership(
+        comm_hash,
+        comm_name,
+        n_nodes,
+        n_ranks,
+        rank,
+        top_parent_ranks,
+        rank_to_node,
+        host_hashes,
+        cuda_devs,
+        bus_ids,
+    );
+}
+
 #[allow(clippy::missing_safety_doc)]
 unsafe extern "C" fn profiler_init_v6(
     context: *mut *mut libc::c_void,

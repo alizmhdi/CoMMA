@@ -114,6 +114,9 @@ pub trait ProfilerEvent {
 pub struct Group {
     basic_info: BasicInfo,
     id: u64,
+    /// Tokens this rank keeps for itself (AllToAll self-copy). Send-to-self
+    /// and recv-from-self are the same memcpy; stored as max, not sum.
+    self_copy_size: AtomicU64,
 }
 
 impl Group {
@@ -124,11 +127,24 @@ impl Group {
         Self {
             basic_info: BasicInfo::from_descr(descr, time),
             id: NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed),
+            self_copy_size: AtomicU64::new(0),
         }
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub fn record_self_copy_size(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.self_copy_size
+            .fetch_max(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn self_copy_size(&self) -> usize {
+        self.self_copy_size.load(Ordering::Relaxed) as usize
     }
 }
 
@@ -152,6 +168,7 @@ pub struct P2pParent {
     pub name: &'static str,
     pub children: Vec<NcclOp>,
     pub partial: bool,
+    pub self_copy_size: usize,
 }
 
 impl P2pParent {
@@ -172,6 +189,7 @@ impl P2pParent {
             "n_peers": self.n_peers,
             "args": {
                 "size": self.size,
+                "self_copy_size": self.self_copy_size,
             },
         });
         if self.partial {
@@ -203,7 +221,8 @@ pub struct NcclOp {
     parent_group_id: Option<u64>,
 }
 
-/// Per-slice Simple-prims KernelStep attached to a Coll/P2p NcclOp.
+/// Per-slice KernelStep attached to a Coll/P2p NcclOp.
+/// `peer` is the communicator-local dest rank; NCCL only exports same-host peers.
 #[derive(Debug, Clone)]
 pub struct KernelEventStep {
     pub channel_id: u8,
@@ -842,6 +861,7 @@ mod tests {
             name: "all_to_all",
             children: Vec::new(),
             partial: false,
+            self_copy_size: 257_536,
         };
         let rec = parent.trace_record(|_| 42);
         assert_eq!(rec["cat"], "P2P_GROUP");
@@ -851,6 +871,7 @@ mod tests {
         assert_eq!(rec["n_peers"], 3);
         assert_eq!(rec["comm_hash"], "0x0000000000000abc");
         assert_eq!(rec["args"]["size"], 4096);
+        assert_eq!(rec["args"]["self_copy_size"], 257_536);
         assert_eq!(rec["dur"], 250);
         assert!(rec.get("p2ps").is_none());
         assert!(rec.get("partial").is_none());
