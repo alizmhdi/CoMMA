@@ -145,6 +145,17 @@ pub enum Message {
         /* parent handle */ usize,
     ),
     KernelStep(event::KernelEventStep, /* parent handle */ usize),
+    StepProgress {
+        source: event::StepProgressSource,
+        stage: event::StepProgressStage,
+        observed_at: Instant,
+        parent: usize,
+        is_send: bool,
+        peer: u32,
+        channel_id: u8,
+        step: i64,
+        size: usize,
+    },
     CommOpen(Communicator),
     CommInit(crate::profiler::CommMembership),
     CommClose(/* comm_hash = */ u64),
@@ -166,6 +177,17 @@ pub enum InterProcessMessage {
 pub const STEP_BATCH_SZ: usize = 64;
 pub type StepBatch = fixed_batch::Batch<EventStep, STEP_BATCH_SZ>;
 
+type PendingProgress = (
+    event::StepProgressSource,
+    event::StepProgressStage,
+    Instant,
+    bool,
+    u32,
+    u8,
+    i64,
+    usize,
+);
+
 /// This separate Telemetry type should make a copy of the Message type.
 /// Doing so decouples:
 ///   1. event management of those shared profiler API handler,
@@ -174,8 +196,11 @@ pub type StepBatch = fixed_batch::Batch<EventStep, STEP_BATCH_SZ>;
 pub enum Telemetry {
     Group(Box<event::Group>),
     NcclOpIssued(Box<event::NcclOp>), // copybara:strip(hang detection)
+    /// Compact GPU completion, independent of delayed child attachment.
+    NcclOpComplete(Box<event::NcclOp>),
     NcclOp(Box<event::NcclOp>),
     P2pParent(Box<event::P2pParent>),
+    StepProgress(event::StepProgress),
     ProxyOp(Box<event::ProxyOp>),
     CommOpen(Communicator),
     CommInit(crate::profiler::CommMembership),
@@ -205,6 +230,19 @@ pub struct PollingContext<'a> {
     peer_rank_fifo: HashMap<libc::pid_t, shm_fifo::mpsc::Sender<InterProcessMessage>>,
     pending_ipc_msg: HashMap<libc::pid_t, VecDeque<InterProcessMessage>>,
     p2p_groups: HashMap<u64, P2pGroupAcc>,
+    /// One compact, live progress marker per NCCL parent/source/peer.  Raw
+    /// KernelStep callbacks can number in the thousands for one collective;
+    /// exporting all of them delays the very deadline decision they serve.
+    active_progress: HashMap<(usize, u8, u32), event::StepProgress>,
+    /// KernelCh and its parent operation can be delivered by different NCCL
+    /// threads. Preserve a completion that wins that race until the launch
+    /// record arrives instead of losing the end-of-collective signal.
+    early_completions: HashMap<usize, (Instant, Instant)>,
+    /// Progress callbacks can race ahead of their parent launch because NCCL
+    /// invokes profiler callbacks from several threads. Preserve the compact
+    /// transition and replay it as soon as the parent is registered.
+    early_progress: HashMap<usize, Vec<PendingProgress>>,
+    online_completed: HashSet<usize>,
 }
 
 impl<'a> PollingContext<'a> {
@@ -220,7 +258,122 @@ impl<'a> PollingContext<'a> {
             peer_rank_fifo: HashMap::new(),
             pending_ipc_msg: HashMap::new(),
             p2p_groups: HashMap::new(),
+            active_progress: HashMap::new(),
+            early_completions: HashMap::new(),
+            early_progress: HashMap::new(),
+            online_completed: HashSet::new(),
         }
+    }
+
+    fn progress_source_id(source: event::StepProgressSource) -> u8 {
+        match source {
+            event::StepProgressSource::Proxy => 0,
+            event::StepProgressSource::Kernel => 1,
+            event::StepProgressSource::KernelCh => 2,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn note_step_progress(
+        &mut self,
+        source: event::StepProgressSource,
+        stage: event::StepProgressStage,
+        observed_at: Instant,
+        parent: usize,
+        is_send: bool,
+        peer: u32,
+        channel_id: u8,
+        step: i64,
+        size: usize,
+    ) {
+        // A cross-thread posted callback can arrive after KernelCh. Never
+        // resurrect progress for a collective already closed.
+        if self.online_completed.contains(&parent) {
+            return;
+        }
+        // An individual transport-step completion is not the parent end.
+        // Parent completion closes every representative endpoint together.
+        if stage == event::StepProgressStage::Complete {
+            return;
+        }
+        let key = (parent, Self::progress_source_id(source), peer);
+        if self.active_progress.contains_key(&key) {
+            return;
+        }
+        let Some(ncclop) = self.get_ncclop(parent) else {
+            let pending = self.early_progress.entry(parent).or_default();
+            if !pending
+                .iter()
+                .any(|(s, _, _, _, p, _, _, _)| *s == source && *p == peer)
+            {
+                pending.push((
+                    source,
+                    stage,
+                    observed_at,
+                    is_send,
+                    peer,
+                    channel_id,
+                    step,
+                    size,
+                ));
+            }
+            return;
+        };
+        let progress = event::StepProgress::from_parent(
+            ncclop,
+            source,
+            stage,
+            observed_at,
+            is_send,
+            peer,
+            channel_id,
+            step,
+            size,
+        );
+        self.active_progress.insert(key, progress.clone());
+        self.pending_telemetry
+            .push_back(Telemetry::StepProgress(progress));
+    }
+
+    fn finish_parent_progress(&mut self, parent: usize, observed_at: Instant) {
+        let keys: Vec<_> = self
+            .active_progress
+            .keys()
+            .filter(|(p, _, _)| *p == parent)
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(mut progress) = self.active_progress.remove(&key) {
+                progress.stage = event::StepProgressStage::Complete;
+                progress.observed_at = observed_at;
+                self.pending_telemetry
+                    .push_back(Telemetry::StepProgress(progress));
+            }
+        }
+    }
+
+    fn complete_ncclop(&mut self, parent: usize, child_start: Instant, end_time: Instant) {
+        if self.online_completed.contains(&parent) {
+            return;
+        }
+
+        let Some(ncclop) = self.get_ncclop(parent) else {
+            self.early_completions
+                .entry(parent)
+                .and_modify(|(start, end)| {
+                    *start = (*start).min(child_start);
+                    *end = (*end).max(end_time);
+                })
+                .or_insert((child_start, end_time));
+            return;
+        };
+        ncclop_update(ncclop, child_start, Some(end_time));
+        let completed = ncclop.clone();
+
+        self.online_completed.insert(parent);
+        self.finish_parent_progress(parent, end_time);
+        self.pending_telemetry
+            .push_back(Telemetry::NcclOpComplete(Box::new(completed)));
     }
 
     fn note_ncclop_start(&mut self, op: &event::NcclOp) {
@@ -327,6 +480,10 @@ impl<'a> PollingContext<'a> {
     }
 
     fn reclaim_ncclop(&mut self, mut op: event::NcclOp) {
+        self.finish_parent_progress(
+            op.id(),
+            op.basic_info().end_time().unwrap_or_else(Instant::now),
+        );
         if !op.is_p2p() {
             self.pending_telemetry
                 .push_back(Telemetry::NcclOp(Box::new(op)));
@@ -597,6 +754,25 @@ impl<'a> PollingContext<'a> {
                 self.pending_telemetry
                     .push_back(Telemetry::NcclOpIssued(Box::new(op)));
                 // copybara:strip_end
+                if let Some(progress) = self.early_progress.remove(&id) {
+                    for (source, stage, observed_at, is_send, peer, channel, step, size) in progress
+                    {
+                        self.note_step_progress(
+                            source,
+                            stage,
+                            observed_at,
+                            id,
+                            is_send,
+                            peer,
+                            channel,
+                            step,
+                            size,
+                        );
+                    }
+                }
+                if let Some((child_start, end_time)) = self.early_completions.remove(&id) {
+                    self.complete_ncclop(id, child_start, end_time);
+                }
                 if self.free_ncclop.num_free() >= slab::FREELIST_BATCH {
                     self.free_ncclop.try_publish(&self.profiler.free_ncclop);
                 }
@@ -694,18 +870,36 @@ impl<'a> PollingContext<'a> {
                 }
             }
             Message::KernelCh(start_time, duration, parent) => {
-                if let Some(ncclop) = self.get_ncclop(parent) {
-                    ncclop_update(
-                        ncclop,
-                        start_time,
-                        Some(start_time + Duration::from_nanos(duration)),
-                    );
-                }
+                let end_time = start_time + Duration::from_nanos(duration);
+                self.complete_ncclop(parent, start_time, end_time);
             }
             Message::KernelStep(step, parent) => {
                 if let Some(ncclop) = self.get_ncclop(parent) {
                     ncclop.add_kernel_step(step);
                 }
+            }
+            Message::StepProgress {
+                source,
+                stage,
+                observed_at,
+                parent,
+                is_send,
+                peer,
+                channel_id,
+                step,
+                size,
+            } => {
+                self.note_step_progress(
+                    source,
+                    stage,
+                    observed_at,
+                    parent,
+                    is_send,
+                    peer,
+                    channel_id,
+                    step,
+                    size,
+                );
             }
             Message::CommOpen(comm) => {
                 self.pending_telemetry.push_back(Telemetry::CommOpen(comm));
@@ -860,6 +1054,7 @@ fn ipc_shm_path(pid: libc::pid_t) -> String {
 
 const FIFO_FETCH_INTERVAL: Duration = Duration::from_secs(1);
 const FIFO_PROCESS_BATCH: usize = 512;
+const ONLINE_FIFO_PROCESS_BATCH: usize = profiler::EVENT_QUEUE_SZ;
 const FIFO_RECV_BATCH: usize = profiler::EVENT_QUEUE_SZ;
 const IPC_RECV_BATCH: usize = 512;
 const IPC_SEND_BATCH: usize = 64;
@@ -922,9 +1117,11 @@ where
             thread
                 .ncclop_fifo
                 .recv_many(FIFO_FETCH_INTERVAL, FIFO_RECV_BATCH, n_recv > 0);
-            thread.ncclop_fifo.process_many(FIFO_PROCESS_BATCH, |msg| {
-                ctx.handle_fifo_message(msg, &mut thread.daemon_state, &mut exporter);
-            });
+            thread
+                .ncclop_fifo
+                .process_many(ONLINE_FIFO_PROCESS_BATCH, |msg| {
+                    ctx.handle_fifo_message(msg, &mut thread.daemon_state, &mut exporter);
+                });
         }
 
         for thread in threads.iter_mut() {
@@ -1034,5 +1231,184 @@ where
     ctx.reclaim_all_ncclops_in_map();
     ctx.flush_p2p_parents();
 
-    exporter.export(ctx, Some(RETRY_MS));
+    // Shutdown may reclaim more records than the bounded Tokio channels can
+    // accept in one pass. Keep draining until every final trace has actually
+    // crossed into the exporter; otherwise categories disappear depending on
+    // queue timing.
+    while !ctx.pending_telemetry.is_empty() {
+        exporter.export(ctx, Some(RETRY_MS));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profiler::Version;
+    use crate::profiler_shim;
+
+    struct NoopExport;
+
+    impl Export for NoopExport {
+        fn export(&self, _ctx: &mut PollingContext, _maybe_retry_ms: Option<u64>) {}
+    }
+
+    fn coll(id: usize, start: Instant) -> slab::AllocatedNode<event::NcclOp> {
+        let descr = profiler_shim::tests::dummy_coll_descr();
+        slab::AllocatedNode::new(event::NcclOp::from_descr(&descr, start, id, None))
+    }
+
+    #[test]
+    fn completion_before_parent_is_preserved_and_late_progress_is_ignored() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let mut thread = ThreadState::default();
+        let mut exporter = NoopExport;
+        let parent = 42;
+        let child_start = Instant::now();
+        let duration = Duration::from_millis(3);
+
+        ctx.handle_fifo_message(
+            Message::KernelCh(child_start, duration.as_nanos() as u64, parent),
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(ctx.early_completions.contains_key(&parent));
+        assert!(!ctx.online_completed.contains(&parent));
+
+        ctx.handle_fifo_message(
+            Message::NcclOp(coll(parent, child_start - Duration::from_millis(1))),
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(!ctx.early_completions.contains_key(&parent));
+        assert!(ctx.online_completed.contains(&parent));
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::NcclOpIssued(_))
+        ));
+        let complete = ctx.pending_telemetry.pop_front();
+        match complete {
+            Some(Telemetry::NcclOpComplete(op)) => {
+                assert_eq!(op.basic_info().end_time(), Some(child_start + duration));
+            }
+            _ => panic!("expected online completion after launch record"),
+        }
+
+        ctx.handle_fifo_message(
+            Message::StepProgress {
+                source: event::StepProgressSource::Kernel,
+                stage: event::StepProgressStage::Posted,
+                observed_at: child_start + duration,
+                parent,
+                is_send: true,
+                peer: 1,
+                channel_id: 0,
+                step: 0,
+                size: 4096,
+            },
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(ctx.active_progress.is_empty());
+        assert!(ctx.pending_telemetry.is_empty());
+    }
+
+    #[test]
+    fn progress_before_parent_is_replayed_before_completion() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let mut thread = ThreadState::default();
+        let mut exporter = NoopExport;
+        let parent = 44;
+        let start = Instant::now();
+
+        ctx.handle_fifo_message(
+            Message::StepProgress {
+                source: event::StepProgressSource::KernelCh,
+                stage: event::StepProgressStage::Posted,
+                observed_at: start,
+                parent,
+                is_send: true,
+                peer: u32::MAX,
+                channel_id: u8::MAX,
+                step: -1,
+                size: 0,
+            },
+            &mut thread,
+            &mut exporter,
+        );
+        assert_eq!(ctx.early_progress.get(&parent).map(Vec::len), Some(1));
+
+        ctx.handle_fifo_message(
+            Message::NcclOp(coll(parent, start - Duration::from_millis(1))),
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(!ctx.early_progress.contains_key(&parent));
+        assert_eq!(ctx.active_progress.len(), 1);
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::NcclOpIssued(_))
+        ));
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::StepProgress(event::StepProgress {
+                source: event::StepProgressSource::KernelCh,
+                stage: event::StepProgressStage::Posted,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn completion_closes_inflight_progress_before_emitting_collective_end() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let mut thread = ThreadState::default();
+        let mut exporter = NoopExport;
+        let parent = 43;
+        let start = Instant::now();
+
+        ctx.handle_fifo_message(
+            Message::NcclOp(coll(parent, start)),
+            &mut thread,
+            &mut exporter,
+        );
+        ctx.pending_telemetry.clear();
+        ctx.handle_fifo_message(
+            Message::StepProgress {
+                source: event::StepProgressSource::Proxy,
+                stage: event::StepProgressStage::Posted,
+                observed_at: start,
+                parent,
+                is_send: true,
+                peer: 2,
+                channel_id: 1,
+                step: 7,
+                size: 8192,
+            },
+            &mut thread,
+            &mut exporter,
+        );
+        assert_eq!(ctx.active_progress.len(), 1);
+        ctx.pending_telemetry.clear();
+
+        ctx.handle_fifo_message(
+            Message::KernelCh(start, 1_000, parent),
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(ctx.active_progress.is_empty());
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::StepProgress(event::StepProgress {
+                stage: event::StepProgressStage::Complete,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::NcclOpComplete(_))
+        ));
+    }
 }

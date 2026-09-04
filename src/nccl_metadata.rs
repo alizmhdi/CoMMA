@@ -710,6 +710,14 @@ pub trait P2p: NcclOp {
     #![allow(dead_code)]
     fn peer(&self) -> i32;
     fn is_send(&self) -> bool;
+    /// NCCL Group handle for this P2P.
+    ///
+    /// Profiler v4 and earlier store it on the descriptor `parentObj`.
+    /// v5+/v6 (KernelStep NCCL) store it on `p2p.parentGroup`; top-level
+    /// `parentObj` is the P2pApi handle and is often null / not a Group.
+    fn parent_group(&self) -> *mut libc::c_void {
+        self.parent_obj()
+    }
     fn op_key(&self, alt_comm_hash: u64) -> NcclOpKey {
         let ctor = if self.is_send() {
             NcclOpKey::P2pSend
@@ -903,6 +911,9 @@ macro_rules! impl_coll {
 
 macro_rules! impl_p2p {
     ($t:ty) => {
+        impl_p2p!($t, parent_obj);
+    };
+    ($t:ty, parent_obj) => {
         impl super::P2p for $t {
             // SAFETY: this type could only be constructed via cast_*(),
             // which must be called with type_ == ncclProfileP2p.
@@ -921,6 +932,29 @@ macro_rules! impl_p2p {
                     let op_type = p2p.func.into_ncclop_type();
                     op_type == NcclOpType::Send
                 }
+            }
+        }
+    };
+    ($t:ty, parent_group) => {
+        impl super::P2p for $t {
+            #[inline(always)]
+            fn peer(&self) -> i32 {
+                let p2p = unsafe { &self.0 .0.__bindgen_anon_1.p2p };
+                p2p.peer
+            }
+
+            #[inline(always)]
+            fn is_send(&self) -> bool {
+                unsafe {
+                    let p2p = &self.0 .0.__bindgen_anon_1.p2p;
+                    let op_type = p2p.func.into_ncclop_type();
+                    op_type == NcclOpType::Send
+                }
+            }
+
+            #[inline(always)]
+            fn parent_group(&self) -> *mut libc::c_void {
+                unsafe { self.0 .0.__bindgen_anon_1.p2p.parentGroup }
             }
         }
     };
@@ -1306,7 +1340,7 @@ mod v6 {
         }
     }
 
-    impl_p2p!(P2p);
+    impl_p2p!(P2p, parent_group);
 
     #[repr(transparent)]
     pub struct ProxyOp(profiler_shim::EventDescrV6);

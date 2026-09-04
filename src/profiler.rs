@@ -37,7 +37,11 @@ use rand::{rngs::SmallRng, RngCore as _, SeedableRng as _};
 use serde_json::json;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Match the monitor's large-step floor.  Progress records smaller than this
+/// add traffic without helping communication localization.
+const ONLINE_PROGRESS_MIN_BYTES: i64 = 4096;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -201,6 +205,7 @@ pub fn thread_local_state(profiler: &'_ Profiler) -> (ThreadLocalState<'_>, daem
         steps_free_list: slab::FreeList::new_list(slab::FREELIST_BATCH * 4),
         kernelch_free_list: slab::FreeList::new_list(slab::FREELIST_BATCH),
         kernelstep_free_list: slab::FreeList::new_list(slab::FREELIST_BATCH * 4),
+        kernel_progress_posted: HashSet::new(),
         proxyop_id: 0,
         rng: SmallRng::from_rng(&mut rand::rng()),
     };
@@ -242,6 +247,10 @@ pub struct ThreadLocalState<'a> {
     pub steps_free_list: slab::FreeList<daemon::StepBatch>,
     pub kernelch_free_list: slab::FreeList<KernelCh>,
     pub kernelstep_free_list: slab::FreeList<KernelStepLocal>,
+    /// NCCL operation ids are monotonic.  Retaining this compact set for the
+    /// process lifetime prevents per-KernelStep telemetry from flooding the
+    /// online monitor while preserving one marker per parent/peer.
+    kernel_progress_posted: HashSet<(usize, u8)>,
 
     proxyop_id: u32,
     rng: SmallRng,
@@ -257,6 +266,12 @@ impl ThreadLocalState<'_> {
     pub fn send_ncclop_to_daemon(&mut self, mut msg: daemon::Message, use_barrier: bool) {
         while let Err(v) = self.ncclop_fifo.send(msg, use_barrier) {
             msg = v;
+        }
+        // This FIFO carries only compact deadline/control records. Publishing
+        // immediately avoids waiting for the receiver's one-second fallback
+        // refresh when traffic is sparse.
+        if use_barrier {
+            self.ncclop_fifo.flush();
         }
     }
 
@@ -530,7 +545,7 @@ pub fn dump_comm_membership(
         ts: Instant::now(),
     };
     with_thread_state(|thread_state| {
-        thread_state.send_to_daemon(daemon::Message::CommInit(membership), true);
+        thread_state.send_ncclop_to_daemon(daemon::Message::CommInit(membership), true);
     });
 }
 
@@ -565,6 +580,9 @@ pub struct ProxyOpLocalData {
     pub parent_op: Option<usize>,
     pub steps: Option<slab::AllocatedNode<daemon::StepBatch>>,
     pub rng_seed: u32,
+    /// A ProxyOp may contain thousands of steps.  One representative send
+    /// transition is enough to identify its active endpoint online.
+    pub progress_posted: bool,
 }
 
 impl ProxyOpLocalData {
@@ -588,6 +606,7 @@ impl ProxyOpLocalData {
             parent_op: None,
             steps: None,
             rng_seed: 0,
+            progress_posted: false,
         }
     }
 
@@ -681,7 +700,7 @@ pub fn init_handler_v4(
     comm.comm_hash = Some(comm_hash);
     if config::CONFIG.heartbeat_collective_progress {
         with_thread_state(|thread_state| {
-            thread_state.send_to_daemon(daemon::Message::CommOpen(*comm.clone()), true)
+            thread_state.send_ncclop_to_daemon(daemon::Message::CommOpen(*comm.clone()), true)
         });
     }
     Ok(comm)
@@ -825,7 +844,7 @@ where
             // broke live period lock. Stamp the byte count on the parent Group
             // so P2P_GROUP.args.self_copy_size is the tokens this rank keeps.
             if descr.peer() == descr.rank() {
-                event_ffi::record_group_self_copy_size(descr.parent_obj(), descr.byte_count());
+                event_ffi::record_group_self_copy_size(descr.parent_group(), descr.byte_count());
                 return Ok(None);
             }
             let should_sample = with_thread_state(|thread_state| {
@@ -968,6 +987,25 @@ where
                                     true,
                                 )
                                 .unwrap();
+                            // KernelCh begins when NCCL observes the channel on
+                            // the GPU, unlike NcclOp launch which is only an
+                            // asynchronous CPU enqueue. Export one compact
+                            // parent-scoped transition so even nNodes=1
+                            // collectives have a real online start signal.
+                            thread_state.send_ncclop_to_daemon(
+                                daemon::Message::StepProgress {
+                                    source: event::StepProgressSource::KernelCh,
+                                    stage: event::StepProgressStage::Posted,
+                                    observed_at: thread_state.profiler.recent_timer_instant(),
+                                    parent: ncclop,
+                                    is_send: true,
+                                    peer: u32::MAX,
+                                    channel_id: u8::MAX,
+                                    step: -1,
+                                    size: 0,
+                                },
+                                true,
+                            );
                             Some(event::Event::KernelCh(kernelch))
                         })
                     } else {
@@ -1058,6 +1096,33 @@ where
                                         true,
                                     )
                                     .unwrap();
+                                // NCCL calls the KernelStep start callback as soon as the
+                                // GPU start ring is visible.  Export that transition now;
+                                // waiting for the stop callback would make an end-deadline
+                                // localizer blind to the in-flight transfer.
+                                if step.is_send
+                                    && step.size as i64 >= ONLINE_PROGRESS_MIN_BYTES
+                                    && thread_state
+                                        .kernel_progress_posted
+                                        .insert((ncclop, step.peer))
+                                {
+                                    thread_state.send_ncclop_to_daemon(
+                                        daemon::Message::StepProgress {
+                                            source: event::StepProgressSource::Kernel,
+                                            stage: event::StepProgressStage::Posted,
+                                            observed_at: thread_state
+                                                .profiler
+                                                .recent_timer_instant(),
+                                            parent: ncclop,
+                                            is_send: step.is_send,
+                                            peer: step.peer as u32,
+                                            channel_id: step.channel_id,
+                                            step: step.step as i64,
+                                            size: step.size as usize,
+                                        },
+                                        true,
+                                    );
+                                }
                                 Some(event::Event::KernelStep(step))
                             })
                         } else {
@@ -1143,7 +1208,7 @@ pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
                         start_time.elapsed().as_nanos() as u64,
                         ncclop,
                     );
-                    thread_state.send_to_daemon(msg, true);
+                    thread_state.send_ncclop_to_daemon(msg, true);
                 }
             }
             thread_state.kernelch_free_list.free(kernelch);
@@ -1231,6 +1296,30 @@ where
                     data.start_time = Some(now);
                 }
                 data.size = e_state_args.trans_size();
+                if data.size as i64 >= ONLINE_PROGRESS_MIN_BYTES {
+                    // SAFETY: state callbacks run on the ProxyStep owner's
+                    // thread while the parent ProxyOp handle is live.
+                    let parent = unsafe { &mut *data.parent };
+                    if parent.info.is_send && !parent.progress_posted {
+                        if let Some(ncclop) = parent.info.parent() {
+                            thread_state.send_ncclop_to_daemon(
+                                daemon::Message::StepProgress {
+                                    source: event::StepProgressSource::Proxy,
+                                    stage: event::StepProgressStage::Posted,
+                                    observed_at: now,
+                                    parent: ncclop,
+                                    is_send: true,
+                                    peer: parent.info.peer,
+                                    channel_id: parent.extra.channel_id,
+                                    step: data.step as i64,
+                                    size: data.size,
+                                },
+                                true,
+                            );
+                            parent.progress_posted = true;
+                        }
+                    }
+                }
                 if let Some(ref remote_net_bytes) = thread_state.profiler.remote_net_bytes {
                     // SAFETY: NCCL guarantees that the proxyop event handle is
                     // live at this moment and the proxystep is on the same thread
@@ -1293,7 +1382,7 @@ pub fn finalize_handler(comm: Box<Communicator>) -> NcclResult<()> {
         let mut lg = INIT_FLAG.lock().unwrap();
         if let Some(comm_hash) = comm.comm_hash {
             with_thread_state(|thread_state| {
-                thread_state.send_to_daemon(daemon::Message::CommClose(comm_hash), true);
+                thread_state.send_ncclop_to_daemon(daemon::Message::CommClose(comm_hash), true);
             });
         }
         if *lg == 1 {

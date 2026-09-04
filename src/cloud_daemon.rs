@@ -86,11 +86,24 @@ impl Telemetry {
             Telemetry::Group(group) => {
                 writeln!(buf, "{}", group.trace_record(&mut time_to_num))?;
             }
+            Telemetry::NcclOpIssued(ncclop) => {
+                writeln!(buf, "{}", ncclop.issued_trace_record(&mut time_to_num))?;
+            }
+            Telemetry::NcclOpComplete(ncclop) => {
+                writeln!(
+                    buf,
+                    "{}",
+                    ncclop.online_complete_trace_record(&mut time_to_num)
+                )?;
+            }
             Telemetry::NcclOp(ncclop) => {
                 writeln!(buf, "{}", ncclop.trace_record(&mut time_to_num))?;
             }
             Telemetry::P2pParent(parent) => {
                 writeln!(buf, "{}", parent.trace_record(&mut time_to_num))?;
+            }
+            Telemetry::StepProgress(progress) => {
+                writeln!(buf, "{}", progress.trace_record(&mut time_to_num))?;
             }
             Telemetry::ProxyOp(proxyop) => {
                 writeln!(buf, "{}", proxyop.trace_record(&mut time_to_num))?;
@@ -358,6 +371,7 @@ async fn connect_latency_sock(path: impl AsRef<std::path::Path>) -> Option<UnixS
 async fn exporter(
     profiler: &'static Profiler,
     mut rx: mpsc::Receiver<Telemetry>,
+    mut online_rx: mpsc::Receiver<Telemetry>,
     otel_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
 ) -> std::io::Result<()> {
     let mut latency_file = if let Some(template) = profiler.config.latency_file.as_ref() {
@@ -438,9 +452,15 @@ async fn exporter(
         None
     };
 
+    let mut regular_closed = false;
+    let mut online_closed = false;
     loop {
         tokio::select! {
-            maybe_telemetry = rx.recv() => {
+            // Online identity/progress/completion records must not sit behind
+            // large completed traces. A biased, bounded lane keeps deadline
+            // state current without adding work to NCCL callbacks.
+            biased;
+            maybe_telemetry = online_rx.recv(), if !online_closed => {
                 match maybe_telemetry {
                     Some(telemetry) => {
                         if let Some(file) = latency_file.as_mut() {
@@ -540,7 +560,86 @@ async fn exporter(
                             }
                         }
                     },
-                    None => break,
+                    None => online_closed = true,
+                }
+            },
+            maybe_telemetry = rx.recv(), if !regular_closed => {
+                match maybe_telemetry {
+                    Some(telemetry) => {
+                        if let Some(file) = latency_file.as_mut() {
+                            let r = telemetry
+                                .write_to_file(
+                                    file,
+                                    |t| profiler.instant_to_timestamp(t).as_micros() as _)
+                                .await;
+                            if let Err(e) = r {
+                                error!("Failed to log latency telemetry to file: {}. Stop logging.", e);
+                                latency_file = None;
+                            }
+                        }
+
+                        if let Some(summary) = summary.as_mut() {
+                            match &telemetry {
+                                Telemetry::NcclOp(op) => {
+                                    summary.add_op(op);
+                                },
+                                Telemetry::P2pParent(parent) => {
+                                    for op in &parent.children {
+                                        summary.add_op(op);
+                                    }
+                                },
+                                Telemetry::NcclOpIssued(op) => {
+                                    summary.record_op_issue(op);
+                                },
+                                Telemetry::CommOpen(comm) => {
+                                    summary.record_comm_open(comm.clone());
+                                }
+                                Telemetry::CommClose(comm_hash) => {
+                                    summary.record_comm_close(*comm_hash);
+                                },
+                                _ => {}
+                            }
+                        }
+
+                        if let Some(gpuviz) = gpuviz.as_mut() {
+                            match &telemetry {
+                                Telemetry::NcclOp(op) => {
+                                    let _ = gpuviz.add_ncclop(op, |t| {
+                                        profiler.instant_to_timestamp(*t).as_nanos() as _
+                                    });
+                                }
+                                Telemetry::P2pParent(parent) => {
+                                    for op in &parent.children {
+                                        let _ = gpuviz.add_ncclop(op, |t| {
+                                            profiler.instant_to_timestamp(*t).as_nanos() as _
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if let Some(otel_tracer) = otel_tracer.as_mut() {
+                            match &telemetry {
+                                Telemetry::NcclOp(op) => {
+                                    let _ = otel_utils::add_ncclop_trace(otel_tracer, profiler, op);
+                                }
+                                Telemetry::P2pParent(parent) => {
+                                    for op in &parent.children {
+                                        let _ = otel_utils::add_ncclop_trace(otel_tracer, profiler, op);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if let Some(gauge) = otel_seqnum_gauge.as_mut() {
+                            if let Telemetry::NcclOpIssued(op) = &telemetry {
+                                let _ = otel_utils::record_ncclop_seqnum(gauge, profiler, op);
+                            }
+                        }
+                    },
+                    None => regular_closed = true,
                 }
             },
             _ = async { latency_flush_interval.as_mut().unwrap().tick().await },
@@ -576,6 +675,9 @@ async fn exporter(
                 }
             },
         }
+        if regular_closed && online_closed {
+            break;
+        }
     }
 
     if let Some(file) = latency_file.as_mut() {
@@ -599,6 +701,7 @@ async fn exporter(
 
 struct Exporter {
     tx: mpsc::Sender<Telemetry>,
+    online_tx: Option<mpsc::Sender<Telemetry>>,
     otel_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
     gpuviz: Option<Mutex<gpuviz::HistogramManager<Arc<gpuviz::Connection>>>>,
     track_step_fifo_wait: bool,
@@ -609,6 +712,7 @@ impl Exporter {
     fn new(tx: mpsc::Sender<Telemetry>) -> Self {
         Self {
             tx,
+            online_tx: None,
             otel_latency_hist_manager: None,
             gpuviz: None,
             track_step_fifo_wait: false,
@@ -618,14 +722,40 @@ impl Exporter {
 
 impl Export for Exporter {
     fn export(&self, ctx: &mut PollingContext, maybe_retry_ms: Option<u64>) {
-        while let Some(telemetry) = ctx.pending_telemetry.pop_front() {
-            if let Err(err) = self.tx.try_send(telemetry) {
+        // Scan each currently pending item once. If the bulk queue is full,
+        // rotate that item to the back so a compact online record behind it
+        // can still reach the priority lane in this polling pass.
+        let mut remaining = ctx.pending_telemetry.len();
+        while remaining > 0 {
+            remaining -= 1;
+            let Some(telemetry) = ctx.pending_telemetry.pop_front() else {
+                break;
+            };
+            let online = matches!(
+                &telemetry,
+                Telemetry::NcclOpIssued(_)
+                    | Telemetry::NcclOpComplete(_)
+                    | Telemetry::StepProgress(_)
+                    | Telemetry::CommOpen(_)
+                    | Telemetry::CommInit(_)
+                    | Telemetry::CommClose(_)
+            );
+            let tx = if online {
+                self.online_tx.as_ref().unwrap_or(&self.tx)
+            } else {
+                &self.tx
+            };
+            if let Err(err) = tx.try_send(telemetry) {
                 match err {
                     TrySendError::Full(v) => {
-                        ctx.pending_telemetry.push_front(v);
-                        match maybe_retry_ms {
-                            None => break,
-                            Some(ms) => std::thread::sleep(Duration::from_micros(ms)),
+                        if online || maybe_retry_ms.is_some() {
+                            ctx.pending_telemetry.push_front(v);
+                            if let Some(ms) = maybe_retry_ms {
+                                std::thread::sleep(Duration::from_micros(ms));
+                            }
+                            break;
+                        } else {
+                            ctx.pending_telemetry.push_back(v);
                         }
                     }
                     _ => {
@@ -692,6 +822,8 @@ async fn main_loop(
     }
     const TELEMETRY_CHANNEL_SZ: usize = 4096;
     let (tx, rx) = mpsc::channel::<Telemetry>(TELEMETRY_CHANNEL_SZ);
+    const ONLINE_CHANNEL_SZ: usize = 1024;
+    let (online_tx, online_rx) = mpsc::channel::<Telemetry>(ONLINE_CHANNEL_SZ);
     let otel_latency_hist_manager = if profiler.config.otel_enable {
         Some(Arc::new(Mutex::new(otel_utils::HistogramManager::new(
             "nccl.net_send.latency",
@@ -701,10 +833,15 @@ async fn main_loop(
     } else {
         None
     };
-    let export_worker =
-        tokio::task::spawn(exporter(profiler, rx, otel_latency_hist_manager.clone()));
+    let export_worker = tokio::task::spawn(exporter(
+        profiler,
+        rx,
+        online_rx,
+        otel_latency_hist_manager.clone(),
+    ));
     let exporter = Exporter {
         tx,
+        online_tx: Some(online_tx),
         otel_latency_hist_manager,
         gpuviz: profiler
             .gpuviz_lib
@@ -780,6 +917,14 @@ mod tests {
         profiler.config.track_interprocess_proxyop = false;
         profiler.config.latency_file = Some(latency_template.clone());
         profiler.config.summary_file = Some(summary_template.clone());
+        // Profiler::new snapshots the startup config into runtime gates before
+        // this test overrides its config fields.
+        profiler
+            .gates
+            .apply_update(&crate::runtime_gates::GateUpdate {
+                track_proxyop: Some(true),
+                ..Default::default()
+            });
         scoped_profiler_test(profiler, |_profiler, thread_state| {
             let group_descr = profiler_shim::tests::dummy_group_descr();
             let coll_descr = profiler_shim::tests::dummy_coll_descr();
@@ -857,7 +1002,14 @@ mod tests {
             }
         }
 
-        assert!(to_find.iter().all(|t| *t.1));
+        assert!(
+            to_find.iter().all(|t| *t.1),
+            "missing telemetry categories: {:?}",
+            to_find
+                .iter()
+                .filter_map(|(category, found)| (!found).then_some(*category))
+                .collect::<Vec<_>>()
+        );
     }
 
     fn reclaim_test_template<F>(n_ncclop: usize, client: F)
