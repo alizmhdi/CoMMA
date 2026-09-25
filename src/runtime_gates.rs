@@ -160,6 +160,9 @@ impl RuntimeGates {
         }
         if self.track_kernel_step() && self.api_v6.load(Ordering::Acquire) {
             mask |= profiler_shim::ncclProfileKernelStep as i32;
+            if self.track_recv_kernel_step() {
+                mask |= profiler_shim::ncclProfileKernelStepRecv as i32;
+            }
         }
         if self.proxy_step_enabled() {
             mask |= profiler_shim::ncclProfileProxyStep as i32;

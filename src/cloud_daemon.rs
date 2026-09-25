@@ -18,6 +18,10 @@ use crate::event::ProfilerEvent as _;
 use crate::gcp_acs_proto;
 use crate::gpuviz;
 use crate::histogram::{Histogram1D, Histogram2D};
+use crate::live_ring::{
+    self, pack_str, RingSlot, RingWriter, SlotKind, DEFAULT_RING_CAPACITY, STEP_SOURCE_KERNEL,
+    STEP_SOURCE_KERNEL_CH, STEP_SOURCE_PROXY, STEP_STAGE_COMPLETE, STEP_STAGE_POSTED,
+};
 use crate::nccl_metadata;
 use crate::nccl_metadata::NcclOpKey;
 use crate::otel_utils;
@@ -27,18 +31,18 @@ use crate::step_tracker::EventStep;
 use gcp_acs_proto::ntc::ActiveCommunicator;
 use gcp_acs_proto::ntc::ClosedCommunicator;
 
-use log::error;
+use log::{error, warn};
 use opentelemetry::global::BoxedTracer as OtelTracer;
 use opentelemetry::metrics::Gauge as OtelGauge;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -98,6 +102,12 @@ impl Telemetry {
             }
             Telemetry::NcclOp(ncclop) => {
                 writeln!(buf, "{}", ncclop.trace_record(&mut time_to_num))?;
+            }
+            Telemetry::P2pParentStart(parent) => {
+                writeln!(buf, "{}", parent.issued_trace_record(&mut time_to_num))?;
+            }
+            Telemetry::P2pGroupSeal(seal) => {
+                writeln!(buf, "{}", seal.trace_record(&mut time_to_num))?;
             }
             Telemetry::P2pParent(parent) => {
                 writeln!(buf, "{}", parent.trace_record(&mut time_to_num))?;
@@ -329,12 +339,23 @@ fn load_usize_as_u64(val: &Arc<AtomicUsize>) -> u64 {
 }
 
 async fn open_trace_file(path: impl AsRef<std::path::Path>) -> std::io::Result<tokio::fs::File> {
-    OpenOptions::new()
+    use std::os::unix::fs::OpenOptionsExt;
+    // The container writes as root but the monitor typically runs as an
+    // unprivileged user on the host. Without world-readable mode the monitor
+    // cannot tail the NDJSON latency file. Force 0666; also fchmod after
+    // open so the process umask cannot strip world/other read/write bits.
+    let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(path)
-        .await
+        .mode(0o666)
+        .open(path.as_ref())
+        .await?;
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        let _ = libc::fchmod(file.as_raw_fd(), 0o666);
+    }
+    Ok(file)
 }
 
 async fn build_bufwriter(
@@ -354,13 +375,32 @@ async fn build_bufwriter(
     }
 }
 
-async fn connect_latency_sock(path: impl AsRef<std::path::Path>) -> Option<UnixStream> {
-    match UnixStream::connect(&path).await {
-        Ok(stream) => Some(stream),
+/// Create (or truncate) the per-pid live-telemetry ring file. Returns
+/// `None` if the writer could not be created; the caller then continues
+/// without the ring and only the optional NDJSON `latency_file` is written.
+fn open_live_ring(dir: &std::path::Path, pid: u32) -> Option<RingWriter> {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        error!(
+            "Failed to prepare live-ring dir {:?}: {}. Live telemetry will be dropped.",
+            dir.as_os_str(),
+            e
+        );
+        return None;
+    }
+    let path: PathBuf = dir.join(format!("ring-{pid}.ring"));
+    match RingWriter::create(&path, DEFAULT_RING_CAPACITY, pid) {
+        Ok(w) => {
+            log::info!(
+                "live-ring open: pid={pid} capacity={} path={}",
+                DEFAULT_RING_CAPACITY,
+                path.display()
+            );
+            Some(w)
+        }
         Err(e) => {
             error!(
-                "Failed to connect latency telemetry socket {:?}: {}.",
-                path.as_ref().as_os_str(),
+                "Failed to create live-ring file {:?}: {}. Live telemetry will be dropped.",
+                path.as_os_str(),
                 e
             );
             None
@@ -368,10 +408,229 @@ async fn connect_latency_sock(path: impl AsRef<std::path::Path>) -> Option<UnixS
     }
 }
 
+/// Try-publish a telemetry record on the ring. Returns the number of slots
+/// consumed (0 when the record is not a live-lane event). Never blocks: a
+/// full ring bumps the ring's `dropped` counter and the record is discarded.
+fn ring_publish(
+    ring: &mut RingWriter,
+    telemetry: &Telemetry,
+    profiler: &'static Profiler,
+) -> usize {
+    let to_us = |t: Instant| -> i64 { profiler.instant_to_timestamp(t).as_micros() as i64 };
+    let attempt = |ring: &mut RingWriter, slot: &RingSlot| -> usize {
+        match ring.push(slot) {
+            Ok(()) => 1,
+            Err(()) => 0,
+        }
+    };
+    match telemetry {
+        Telemetry::NcclOpIssued(op) => {
+            let slot = encode_ncclop_issue(op, to_us);
+            attempt(ring, &slot)
+        }
+        Telemetry::NcclOpComplete(op) => {
+            let slot = encode_ncclop_complete(op, to_us);
+            attempt(ring, &slot)
+        }
+        Telemetry::P2pParentStart(parent) => {
+            let slot = encode_p2p_group_start(parent, to_us);
+            attempt(ring, &slot)
+        }
+        Telemetry::P2pGroupSeal(seal) => {
+            let slot = encode_p2p_group_seal(seal, to_us);
+            attempt(ring, &slot)
+        }
+        Telemetry::StepProgress(progress) => {
+            let slot = encode_step_progress(progress, to_us);
+            attempt(ring, &slot)
+        }
+        Telemetry::CommInit(membership) => encode_comm_init(ring, membership, to_us),
+        Telemetry::KernelCopy(c) => attempt(ring, &encode_kernel_copy(c, to_us)),
+        // The following variants are intentionally *not* published on the
+        // live ring:
+        //  - CommOpen / CommClose: currently only affect the summary
+        //    heartbeat; the monitor does not consume them.
+        //  - Rich Group / NcclOp / P2pParent / ProxyOp: full offline traces
+        //    with nested Vec<> children; they may still be written to the
+        //    optional NCCL_PROFILER_LATENCY_FILE NDJSON.
+        _ => 0,
+    }
+}
+
+fn encode_ncclop_issue(op: &event::NcclOp, to_us: impl Fn(Instant) -> i64) -> RingSlot {
+    let basic = op.basic_info();
+    let mut slot = RingSlot::zeroed();
+    slot.ts = to_us(basic.start_time());
+    slot.rank = basic.rank() as i32;
+    slot.comm_hash = op.comm_hash();
+    slot.payload_bytes = op.byte_count() as i64;
+    if let Some(coll) = op.get_descr().try_cast_to_coll() {
+        slot.kind = SlotKind::CollStart as u8;
+        pack_str(&mut slot.name, coll.op_type().name());
+        slot.seq_num = coll.seq_num() as i64;
+    } else if let Some(p2p) = op.get_descr().try_cast_to_p2p() {
+        slot.kind = SlotKind::P2pStart as u8;
+        pack_str(&mut slot.name, if p2p.is_send() { "send" } else { "recv" });
+        slot.is_send = p2p.is_send() as u8;
+        slot.peer = p2p.peer();
+        slot.group_id = op.parent_group_id().unwrap_or(0);
+    }
+    slot
+}
+
+fn encode_ncclop_complete(op: &event::NcclOp, to_us: impl Fn(Instant) -> i64) -> RingSlot {
+    let basic = op.basic_info();
+    let start = basic.start_time();
+    let end = basic.end_time().unwrap_or(start);
+    let mut slot = RingSlot::zeroed();
+    slot.ts = to_us(start);
+    slot.duration_us = (end - start).as_micros() as i64;
+    slot.rank = basic.rank() as i32;
+    slot.comm_hash = op.comm_hash();
+    slot.payload_bytes = op.byte_count() as i64;
+    if let Some(coll) = op.get_descr().try_cast_to_coll() {
+        slot.kind = SlotKind::CollComplete as u8;
+        pack_str(&mut slot.name, coll.op_type().name());
+        slot.seq_num = coll.seq_num() as i64;
+    } else if let Some(p2p) = op.get_descr().try_cast_to_p2p() {
+        slot.kind = SlotKind::P2pComplete as u8;
+        pack_str(&mut slot.name, if p2p.is_send() { "send" } else { "recv" });
+        slot.is_send = p2p.is_send() as u8;
+        slot.peer = p2p.peer();
+        slot.group_id = op.parent_group_id().unwrap_or(0);
+    }
+    slot
+}
+
+fn encode_p2p_group_start(parent: &event::P2pParent, to_us: impl Fn(Instant) -> i64) -> RingSlot {
+    let mut slot = RingSlot::zeroed();
+    slot.kind = SlotKind::P2pGroupStart as u8;
+    slot.ts = to_us(parent.start_time);
+    slot.rank = parent.rank as i32;
+    slot.comm_hash = parent.comm_hash;
+    slot.group_id = parent.group_id;
+    slot.n_children = parent.n_children as u32;
+    slot.n_peers = parent.n_peers as u32;
+    slot.payload_bytes = parent.size as i64;
+    slot.self_copy_size = parent.self_copy_size as i64;
+    pack_str(&mut slot.name, parent.name);
+    slot
+}
+
+fn encode_kernel_copy(c: &KernelCopySummary, to_us: impl Fn(Instant) -> i64) -> RingSlot {
+    let mut slot = RingSlot::zeroed();
+    slot.kind = SlotKind::KernelCopy as u8;
+    slot.ts = to_us(c.observed_at);
+    slot.rank = c.rank as i32;
+    slot.payload_bytes = c.bytes;
+    slot.step = c.copy_ns;
+    slot.duration_us = c.copy_ns / 1000;
+    slot.n_children = c.steps;
+    pack_str(&mut slot.name, "KernelCopy");
+    slot
+}
+
+fn encode_p2p_group_seal(seal: &event::P2pGroupSeal, to_us: impl Fn(Instant) -> i64) -> RingSlot {
+    let mut slot = RingSlot::zeroed();
+    slot.kind = SlotKind::P2pGroupSeal as u8;
+    slot.ts = to_us(seal.observed_at);
+    slot.group_id = seal.group_id;
+    slot.n_children = seal.n_children as u32;
+    pack_str(&mut slot.name, "P2P_GROUP_SEAL");
+    slot
+}
+
+fn encode_step_progress(
+    progress: &event::StepProgress,
+    to_us: impl Fn(Instant) -> i64,
+) -> RingSlot {
+    let mut slot = RingSlot::zeroed();
+    slot.kind = SlotKind::StepProgress as u8;
+    slot.source = match progress.source {
+        event::StepProgressSource::Proxy => STEP_SOURCE_PROXY,
+        event::StepProgressSource::Kernel => STEP_SOURCE_KERNEL,
+        event::StepProgressSource::KernelCh => STEP_SOURCE_KERNEL_CH,
+    };
+    slot.stage = match progress.stage {
+        event::StepProgressStage::Posted => STEP_STAGE_POSTED,
+        event::StepProgressStage::Complete => STEP_STAGE_COMPLETE,
+    };
+    slot.ts = to_us(progress.observed_at);
+    slot.launch_ts = to_us(progress.parent_start);
+    slot.rank = progress.rank as i32;
+    slot.comm_hash = progress.comm_hash;
+    slot.seq_num = progress.seq_num;
+    slot.group_id = progress.parent_group_id.unwrap_or(0);
+    slot.is_send = progress.is_send as u8;
+    slot.peer = progress.peer as i32;
+    slot.channel = progress.channel_id as i32;
+    slot.step = progress.step;
+    slot.size = progress.size as i64;
+    let name = match progress.source {
+        event::StepProgressSource::Proxy => "ProxyStep",
+        event::StepProgressSource::Kernel => "KernelStep",
+        event::StepProgressSource::KernelCh => "KernelCh",
+    };
+    pack_str(&mut slot.name, name);
+    pack_str(&mut slot.parent_name, &progress.parent_name);
+    slot
+}
+
+/// Fans a `CommInit` out into one header slot plus one member slot per
+/// entry. Returns the number of slots that actually reached the ring.
+fn encode_comm_init(
+    ring: &mut RingWriter,
+    membership: &crate::profiler::CommMembership,
+    to_us: impl Fn(Instant) -> i64,
+) -> usize {
+    let mut header = RingSlot::zeroed();
+    header.kind = SlotKind::CommInitHeader as u8;
+    header.ts = to_us(membership.ts);
+    header.rank = membership.rank;
+    header.world_rank = membership.world_rank;
+    header.comm_hash = membership.comm_hash;
+    header.n_nodes = membership.n_nodes;
+    header.n_ranks = membership.n_ranks;
+    pack_str(&mut header.comm_name, &membership.comm_name);
+    pack_str(&mut header.host, &membership.host);
+    pack_str(&mut header.ip, &membership.ip);
+
+    let mut written = 0usize;
+    if ring.push(&header).is_ok() {
+        written += 1;
+    } else {
+        // If the header did not make it, do not fan out the members; a
+        // half-init dump only confuses the consumer.
+        return 0;
+    }
+    for m in &membership.members {
+        let mut s = RingSlot::zeroed();
+        s.kind = SlotKind::CommInitMember as u8;
+        s.ts = header.ts;
+        s.rank = membership.rank;
+        s.comm_hash = membership.comm_hash;
+        s.member_rank = m.rank;
+        s.member_world_rank = m.world_rank;
+        s.member_node = m.node;
+        s.member_cuda_dev = m.cuda_dev;
+        s.member_host_hash = m.host_hash;
+        s.member_bus_id = m.bus_id;
+        if ring.push(&s).is_ok() {
+            written += 1;
+        } else {
+            // Ring is full mid-fan-out. Consumer will time out this partial
+            // COMM_INIT and drop it; do not spin forever waiting for room.
+            break;
+        }
+    }
+    written
+}
+
 async fn exporter(
     profiler: &'static Profiler,
     mut rx: mpsc::Receiver<Telemetry>,
     mut online_rx: mpsc::Receiver<Telemetry>,
+    mut deadline_rx: mpsc::Receiver<Telemetry>,
     otel_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
 ) -> std::io::Result<()> {
     let mut latency_file = if let Some(template) = profiler.config.latency_file.as_ref() {
@@ -381,17 +640,20 @@ async fn exporter(
         None
     };
 
-    let latency_sock_path = profiler
-        .config
-        .latency_sock
-        .as_ref()
-        .map(|template| template.replace("%p", &format!("{}", profiler.pid)));
-    let mut latency_sock = if let Some(path) = latency_sock_path.as_ref() {
-        connect_latency_sock(path).await
-    } else {
-        None
-    };
-    let mut next_latency_sock_retry = Instant::now();
+    // Live-telemetry file-backed SPSC ring. This is the only live-path
+    // transport; the deprecated NDJSON Unix stream socket has been removed.
+    let mut live_ring: Option<RingWriter> =
+        profiler
+            .config
+            .latency_ring_dir
+            .as_ref()
+            .and_then(|dir_template| {
+                let dir_str = dir_template.replace("%p", &format!("{}", profiler.pid));
+                open_live_ring(std::path::Path::new(&dir_str), profiler.pid as u32)
+            });
+    if live_ring.is_none() && profiler.config.latency_ring_dir.is_some() {
+        warn!("live-ring requested but not opened; online monitor will see nothing.");
+    }
 
     let mut summary_file = if let Some(template) = profiler.config.summary_file.as_ref() {
         let path = template.replace("%p", &format!("{}", profiler.pid));
@@ -454,13 +716,21 @@ async fn exporter(
 
     let mut regular_closed = false;
     let mut online_closed = false;
+    let mut deadline_closed = false;
     loop {
         tokio::select! {
-            // Online identity/progress/completion records must not sit behind
-            // large completed traces. A biased, bounded lane keeps deadline
-            // state current without adding work to NCCL callbacks.
+            // Deadline lifecycle has its own biased lane. High-volume RDMA
+            // timestamps and progress remain online, but cannot delay parent
+            // start/seal/completion records that drive the monitor clock.
             biased;
-            maybe_telemetry = online_rx.recv(), if !online_closed => {
+            online_item = async {
+                tokio::select! {
+                    biased;
+                    item = deadline_rx.recv(), if !deadline_closed => (true, item),
+                    item = online_rx.recv(), if !online_closed => (false, item),
+                }
+            }, if !deadline_closed || !online_closed => {
+                let (from_deadline_lane, maybe_telemetry) = online_item;
                 match maybe_telemetry {
                     Some(telemetry) => {
                         if let Some(file) = latency_file.as_mut() {
@@ -475,28 +745,11 @@ async fn exporter(
                             }
                         }
 
-                        if latency_sock.is_none() {
-                            if let Some(path) = latency_sock_path.as_ref() {
-                                if Instant::now() >= next_latency_sock_retry {
-                                    latency_sock = connect_latency_sock(path).await;
-                                    if latency_sock.is_none() {
-                                        next_latency_sock_retry = Instant::now() + Duration::from_secs(1);
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(stream) = latency_sock.as_mut() {
-                            let r = telemetry
-                                .write_to_file(
-                                    stream,
-                                    |t| profiler.instant_to_timestamp(t).as_micros() as _)
-                                .await;
-                            if let Err(e) = r {
-                                error!("Failed to stream latency telemetry to socket: {}. Will retry.", e);
-                                latency_sock = None;
-                                next_latency_sock_retry = Instant::now() + Duration::from_secs(1);
-                            }
+                        // Live telemetry: encode into packed POD slots and
+                        // push onto the file-backed SPSC ring. Non-blocking:
+                        // a full ring bumps the ring's `dropped` counter.
+                        if let Some(ring) = live_ring.as_mut() {
+                            let _ = ring_publish(ring, &telemetry, profiler);
                         }
 
                         if let Some(summary) = summary.as_mut() {
@@ -560,7 +813,13 @@ async fn exporter(
                             }
                         }
                     },
-                    None => online_closed = true,
+                    None => {
+                        if from_deadline_lane {
+                            deadline_closed = true;
+                        } else {
+                            online_closed = true;
+                        }
+                    },
                 }
             },
             maybe_telemetry = rx.recv(), if !regular_closed => {
@@ -675,9 +934,18 @@ async fn exporter(
                 }
             },
         }
-        if regular_closed && online_closed {
+        // Flush pending live-ring writes on every polling boundary so the
+        // consumer's cache-visible write head does not lag by a batch.
+        if let Some(ring) = live_ring.as_mut() {
+            ring.flush();
+        }
+        if regular_closed && online_closed && deadline_closed {
             break;
         }
+    }
+
+    if let Some(ring) = live_ring.as_mut() {
+        ring.close();
     }
 
     if let Some(file) = latency_file.as_mut() {
@@ -702,6 +970,7 @@ async fn exporter(
 struct Exporter {
     tx: mpsc::Sender<Telemetry>,
     online_tx: Option<mpsc::Sender<Telemetry>>,
+    deadline_tx: Option<mpsc::Sender<Telemetry>>,
     otel_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
     gpuviz: Option<Mutex<gpuviz::HistogramManager<Arc<gpuviz::Connection>>>>,
     track_step_fifo_wait: bool,
@@ -713,6 +982,7 @@ impl Exporter {
         Self {
             tx,
             online_tx: None,
+            deadline_tx: None,
             otel_latency_hist_manager: None,
             gpuviz: None,
             track_step_fifo_wait: false,
@@ -731,16 +1001,14 @@ impl Export for Exporter {
             let Some(telemetry) = ctx.pending_telemetry.pop_front() else {
                 break;
             };
-            let online = matches!(
-                &telemetry,
-                Telemetry::NcclOpIssued(_)
-                    | Telemetry::NcclOpComplete(_)
-                    | Telemetry::StepProgress(_)
-                    | Telemetry::CommOpen(_)
-                    | Telemetry::CommInit(_)
-                    | Telemetry::CommClose(_)
-            );
-            let tx = if online {
+            let deadline = is_deadline_telemetry(&telemetry);
+            let online = deadline || is_online_evidence(&telemetry);
+            let tx = if deadline {
+                self.deadline_tx
+                    .as_ref()
+                    .or(self.online_tx.as_ref())
+                    .unwrap_or(&self.tx)
+            } else if online {
                 self.online_tx.as_ref().unwrap_or(&self.tx)
             } else {
                 &self.tx
@@ -748,7 +1016,7 @@ impl Export for Exporter {
             if let Err(err) = tx.try_send(telemetry) {
                 match err {
                     TrySendError::Full(v) => {
-                        if online || maybe_retry_ms.is_some() {
+                        if deadline || maybe_retry_ms.is_some() {
                             ctx.pending_telemetry.push_front(v);
                             if let Some(ms) = maybe_retry_ms {
                                 std::thread::sleep(Duration::from_micros(ms));
@@ -808,6 +1076,42 @@ impl Export for Exporter {
     }
 }
 
+fn is_deadline_telemetry(telemetry: &Telemetry) -> bool {
+    matches!(
+        telemetry,
+        Telemetry::NcclOpIssued(_)
+            | Telemetry::P2pParentStart(_)
+            | Telemetry::P2pGroupSeal(_)
+            | Telemetry::NcclOpComplete(_)
+            | Telemetry::CommOpen(_)
+            | Telemetry::CommInit(_)
+            | Telemetry::CommClose(_)
+    )
+}
+
+fn is_online_evidence(telemetry: &Telemetry) -> bool {
+    matches!(
+        telemetry,
+        Telemetry::StepProgress(_) | Telemetry::KernelCopy(_)
+    )
+}
+
+#[cfg(test)]
+mod deadline_lane_tests {
+    use super::*;
+
+    #[test]
+    fn p2p_seal_uses_deadline_lane() {
+        let seal = Telemetry::P2pGroupSeal(event::P2pGroupSeal {
+            group_id: 7,
+            n_children: 4,
+            observed_at: Instant::now(),
+        });
+        assert!(is_deadline_telemetry(&seal));
+        assert!(!is_online_evidence(&seal));
+    }
+}
+
 async fn main_loop(
     profiler: &'static Profiler,
     stop: oneshot::Receiver<()>,
@@ -824,6 +1128,8 @@ async fn main_loop(
     let (tx, rx) = mpsc::channel::<Telemetry>(TELEMETRY_CHANNEL_SZ);
     const ONLINE_CHANNEL_SZ: usize = 1024;
     let (online_tx, online_rx) = mpsc::channel::<Telemetry>(ONLINE_CHANNEL_SZ);
+    const DEADLINE_CHANNEL_SZ: usize = 256;
+    let (deadline_tx, deadline_rx) = mpsc::channel::<Telemetry>(DEADLINE_CHANNEL_SZ);
     let otel_latency_hist_manager = if profiler.config.otel_enable {
         Some(Arc::new(Mutex::new(otel_utils::HistogramManager::new(
             "nccl.net_send.latency",
@@ -837,11 +1143,13 @@ async fn main_loop(
         profiler,
         rx,
         online_rx,
+        deadline_rx,
         otel_latency_hist_manager.clone(),
     ));
     let exporter = Exporter {
         tx,
         online_tx: Some(online_tx),
+        deadline_tx: Some(deadline_tx),
         otel_latency_hist_manager,
         gpuviz: profiler
             .gpuviz_lib

@@ -158,6 +158,26 @@ pub(crate) mod tests {
         EventDescrV2(descr)
     }
 
+    pub(crate) fn dummy_p2p_descr(peer: i32, is_send: bool) -> EventDescr {
+        let mut descr: ncclProfilerEventDescr_v2_t = unsafe { std::mem::zeroed() };
+        descr.type_ = ncclProfileP2p as _;
+        descr.parentObj = std::ptr::null_mut();
+        descr.rank = 0;
+        unsafe {
+            let p2p = &mut descr.__bindgen_anon_1.p2p;
+            p2p.commHash = 0xabc;
+            p2p.peer = peer;
+            p2p.func = if is_send {
+                c"Send".as_ptr()
+            } else {
+                c"Recv".as_ptr()
+            };
+            p2p.count = 1024;
+            p2p.datatype = c"ncclInt8".as_ptr();
+        }
+        EventDescrV2(descr)
+    }
+
     pub(crate) fn dummy_proxyop_descr() -> EventDescr {
         let mut descr: ncclProfilerEventDescr_v2_t = unsafe { std::mem::zeroed() };
         descr.type_ = ncclProfileProxyOp as _;

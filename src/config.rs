@@ -95,8 +95,10 @@ pub struct Config {
 
     // Export method & config
     pub latency_file: Option<String>,
-    /// Unix stream socket path for live NDJSON latency telemetry.
-    pub latency_sock: Option<String>,
+    /// Directory hosting the per-process live-telemetry SPSC ring file.
+    /// Producer creates `<dir>/ring-<pid>.ring`; monitor discovers it via
+    /// the same directory. See `live_ring.rs` for the layout contract.
+    pub latency_ring_dir: Option<String>,
     pub latency_flush_interval: Duration,
     pub summary_file: Option<String>,
     pub summary_interval: Duration,
@@ -165,7 +167,7 @@ impl Config {
         field_from_env!(s, use_cached_clock, false);
 
         field_from_env!(s, latency_file);
-        field_from_env!(s, latency_sock);
+        field_from_env!(s, latency_ring_dir);
         // 0 disables periodic flushing (stock behavior: flush on shutdown only).
         field_from_env!(s, latency_flush_interval, Duration::from_secs(0));
         field_from_env!(s, summary_file);

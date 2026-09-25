@@ -30,6 +30,11 @@ use std::time::Instant;
 
 static NEXT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Allocate a stable Group / synthetic P2P-parent id.
+pub fn next_group_id() -> u64 {
+    NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Debug)]
 pub enum Event {
     Group(Box<Group>),
@@ -126,7 +131,7 @@ impl Group {
     {
         Self {
             basic_info: BasicInfo::from_descr(descr, time),
-            id: NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_group_id(),
             self_copy_size: AtomicU64::new(0),
         }
     }
@@ -171,6 +176,34 @@ pub struct P2pParent {
     pub self_copy_size: usize,
 }
 
+/// Compact online marker that fixes the final child count of a P2P group.
+/// Child GPU completions are already exported independently; this marker lets
+/// the monitor close their parent without waiting for rich-record reclamation.
+#[derive(Debug, Clone)]
+pub struct P2pGroupSeal {
+    pub group_id: u64,
+    pub n_children: usize,
+    pub observed_at: Instant,
+}
+
+impl P2pGroupSeal {
+    pub fn trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        json!({
+            "ph": "i",
+            "s": "t",
+            "ts": time_to_num(self.observed_at),
+            "dur": 0,
+            "cat": "P2P_GROUP_SEAL",
+            "name": "P2P_GROUP_SEAL",
+            "group_id": self.group_id,
+            "n_children": self.n_children,
+        })
+    }
+}
+
 impl P2pParent {
     pub fn trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
     where
@@ -200,6 +233,39 @@ impl P2pParent {
                 .children
                 .iter()
                 .map(|c| c.trace_record(&mut time_to_num))
+                .collect();
+        }
+        rec
+    }
+
+    /// In-flight parent launch. Emitted when the first grouped P2P is issued,
+    /// before NCCL Group stop and before any child completes, so the monitor
+    /// can open one CO while later send/recv starts are still arriving.
+    pub fn issued_trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        let mut rec = json!({
+            "ph": "B",
+            "ts": time_to_num(self.start_time),
+            "dur": 0,
+            "cat": "P2P_GROUP_START",
+            "name": self.name,
+            "rank": self.rank,
+            "comm_hash": format!("0x{:016x}", self.comm_hash),
+            "group_id": self.group_id,
+            "n_children": self.n_children,
+            "n_peers": self.n_peers,
+            "args": {
+                "size": self.size,
+                "self_copy_size": self.self_copy_size,
+            },
+        });
+        if !self.children.is_empty() {
+            rec["p2ps"] = self
+                .children
+                .iter()
+                .map(|c| c.issued_trace_record(&mut time_to_num))
                 .collect();
         }
         rec
@@ -264,6 +330,7 @@ pub struct StepProgress {
     pub stage: StepProgressStage,
     pub observed_at: Instant,
     pub parent_start: Instant,
+    pub parent_group_id: Option<u64>,
     pub rank: usize,
     pub comm_hash: u64,
     pub seq_num: i64,
@@ -298,6 +365,7 @@ impl StepProgress {
             stage,
             observed_at,
             parent_start: parent.basic_info.start_time(),
+            parent_group_id: parent.parent_group_id(),
             rank: parent.basic_info.rank(),
             comm_hash: parent.comm_hash(),
             seq_num,
@@ -319,7 +387,7 @@ impl StepProgress {
             StepProgressSource::Kernel => ("KernelStep", "kernel"),
             StepProgressSource::KernelCh => ("KernelCh", "kernel_ch"),
         };
-        json!({
+        let mut json = json!({
             "ph": if self.stage == StepProgressStage::Posted { "B" } else { "E" },
             "cat": "STEP_PROGRESS",
             "name": name,
@@ -337,7 +405,11 @@ impl StepProgress {
             "step": self.step,
             "size": self.size,
             "in_flight": self.stage != StepProgressStage::Complete,
-        })
+        });
+        if let Some(gid) = self.parent_group_id {
+            json["parent"] = json!(gid);
+        }
+        json
     }
 }
 
@@ -492,6 +564,10 @@ impl NcclOp {
         self.parent_group_id = None;
     }
 
+    pub fn set_parent_group_id(&mut self, gid: u64) {
+        self.parent_group_id = Some(gid);
+    }
+
     /// Launch sighting for the monitor end-of-CO clock. Emitted at issue,
     /// before reclaim, so the detector can arm `launch + duration + margin`.
     pub fn issued_trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
@@ -518,9 +594,10 @@ impl NcclOp {
             let p2p = self.descr.try_cast_to_p2p().unwrap();
             json["name"] = json!(if p2p.is_send() { "send" } else { "recv" });
             json["peer"] = json!(p2p.peer());
+            if let Some(gid) = self.parent_group_id {
+                json["parent"] = json!(gid);
+            }
         }
-        // Online starts/completions use individual P2Ps. Rich completed
-        // records retain group parenting for offline analysis.
         json
     }
 
@@ -551,6 +628,9 @@ impl NcclOp {
             json["name"] = json!(if p2p.is_send() { "send" } else { "recv" });
             json["peer"] = json!(p2p.peer());
             json["is_send"] = json!(p2p.is_send());
+            if let Some(gid) = self.parent_group_id {
+                json["parent"] = json!(gid);
+            }
         }
         json
     }
@@ -616,6 +696,11 @@ impl NcclOp {
             self.proxyops = Some(Vec::new());
         }
         self.proxyops.as_mut().unwrap().push(proxyop);
+    }
+
+    /// KernelSteps nested under this op (same-host peers only).
+    pub fn kernel_steps(&self) -> &[KernelEventStep] {
+        self.kernel_steps.as_deref().unwrap_or(&[])
     }
 
     pub fn add_kernel_step(&mut self, step: KernelEventStep) {
@@ -1048,6 +1133,14 @@ mod tests {
         assert_eq!(rec["dur"], 250);
         assert!(rec.get("p2ps").is_none());
         assert!(rec.get("partial").is_none());
+
+        let start_rec = parent.issued_trace_record(|_| 7);
+        assert_eq!(start_rec["cat"], "P2P_GROUP_START");
+        assert_eq!(start_rec["ph"], "B");
+        assert_eq!(start_rec["dur"], 0);
+        assert_eq!(start_rec["ts"], 7);
+        assert_eq!(start_rec["group_id"], 7);
+        assert!(start_rec.get("p2ps").is_none());
     }
 
     fn live_group_handle() -> (*mut libc::c_void, u64) {

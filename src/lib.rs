@@ -23,6 +23,7 @@ mod fixed_batch;
 mod gcp_acs_proto; // copybara:strip(oss_protobuf)
 mod gpuviz;
 mod histogram;
+mod live_ring;
 mod nccl_metadata;
 mod otel_utils; // copybara:strip(otel)
 mod profiler;
