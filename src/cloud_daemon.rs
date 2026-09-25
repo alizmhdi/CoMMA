@@ -526,6 +526,13 @@ fn encode_kernel_copy(c: &KernelCopySummary, to_us: impl Fn(Instant) -> i64) -> 
     slot.step = c.copy_ns;
     slot.duration_us = c.copy_ns / 1000;
     slot.n_children = c.steps;
+    if let Some(parent) = c.parent.as_ref() {
+        slot.launch_ts = to_us(parent.parent_start);
+        slot.comm_hash = parent.comm_hash;
+        slot.seq_num = parent.seq_num;
+        slot.group_id = parent.group_id.unwrap_or(0);
+        pack_str(&mut slot.parent_name, &parent.parent_name);
+    }
     pack_str(&mut slot.name, "KernelCopy");
     slot
 }

@@ -211,16 +211,57 @@ pub enum Telemetry {
     CommOpen(Communicator),
     CommInit(crate::profiler::CommMembership),
     CommClose(/* comm_hash = */ u64),
-    /// Same-host GPU copy summary of the KernelSteps processed in one polling
-    /// pass, independent of whether their parent op is still tracked.
+    /// Same-host GPU copy summary of one parent op's KernelSteps processed in
+    /// one polling pass, independent of whether that op is still tracked.
     KernelCopy(KernelCopySummary),
 }
 
 /// Smallest KernelStep counted toward the copy-bandwidth summary.
 pub const KERNEL_COPY_MIN_BYTES: u32 = 65_536;
 
+/// Parent ops whose identity is kept for late KernelSteps.
+const COPY_PARENT_CAP: usize = 16_384;
+
+/// Identity of a KernelStep's parent op, the same fields its online progress
+/// carries. Kept after the op is reclaimed: bulk-FIFO KernelSteps can arrive
+/// later.
+#[derive(Debug, Clone)]
+pub struct CopyParent {
+    pub rank: usize,
+    pub comm_hash: u64,
+    pub seq_num: i64,
+    pub group_id: Option<u64>,
+    pub parent_name: String,
+    pub parent_start: Instant,
+}
+
+impl CopyParent {
+    fn of(op: &event::NcclOp) -> Self {
+        let p = event::StepProgress::from_parent(
+            op,
+            event::StepProgressSource::Kernel,
+            event::StepProgressStage::Complete,
+            op.basic_info().start_time(),
+            true,
+            0,
+            0,
+            0,
+            0,
+        );
+        Self {
+            rank: p.rank,
+            comm_hash: p.comm_hash,
+            seq_num: p.seq_num,
+            group_id: p.parent_group_id,
+            parent_name: p.parent_name,
+            parent_start: p.parent_start,
+        }
+    }
+}
+
 /// `bytes` of send KernelSteps copied in `copy_ns` of GPU time
-/// (`end_ts - ready_ts`, credit wait excluded) across `steps` steps.
+/// (`end_ts - ready_ts`, credit wait excluded) across `steps` steps, all of
+/// one parent op (`parent`, when its identity is still known).
 #[derive(Debug, Clone)]
 pub struct KernelCopySummary {
     pub rank: usize,
@@ -228,6 +269,7 @@ pub struct KernelCopySummary {
     pub copy_ns: i64,
     pub steps: u32,
     pub observed_at: Instant,
+    pub parent: Option<CopyParent>,
 }
 
 /// Accumulator for P2Ps that share one NCCL Group. Native COLLs in the same
@@ -252,11 +294,16 @@ pub struct PollingContext<'a> {
     pub ncclops: BTreeMap<usize, Box<event::NcclOp>>,
     pub pending_telemetry: VecDeque<Telemetry>,
     stop: Arc<AtomicBool>,
-    /// KernelStep copy time accumulated since the last flush. Parent ops can
-    /// be reclaimed before their (bulk-FIFO) KernelSteps arrive, so the copy
-    /// summary must not depend on attaching steps to a live op.
-    copy_acc: (i64, i64, u32),
+    /// KernelStep copy time accumulated per parent op since the last flush.
+    /// Parent ops can be reclaimed before their (bulk-FIFO) KernelSteps
+    /// arrive, so the summary must not depend on attaching steps to a live op.
+    copy_acc: HashMap<usize, (i64, i64, u32)>,
     copy_rank: Option<usize>,
+    /// Identity of recently registered parent ops, with a generation so a
+    /// reused op id evicts only its own older entry.
+    copy_parents: HashMap<usize, (CopyParent, u64)>,
+    copy_parent_order: VecDeque<(usize, u64)>,
+    copy_parent_gen: u64,
 
     free_ncclop: slab::FreeList<event::NcclOp>,
     free_proxyop: slab::FreeList<event::ProxyOp>,
@@ -288,8 +335,11 @@ impl<'a> PollingContext<'a> {
             ncclops: BTreeMap::new(),
             pending_telemetry: VecDeque::new(),
             stop: stop_signal,
-            copy_acc: (0, 0, 0),
+            copy_acc: HashMap::new(),
             copy_rank: None,
+            copy_parents: HashMap::new(),
+            copy_parent_order: VecDeque::new(),
+            copy_parent_gen: 0,
             free_ncclop: slab::FreeList::default(),
             free_proxyop: slab::FreeList::default(),
             free_step_batch: slab::FreeList::default(),
@@ -303,23 +353,49 @@ impl<'a> PollingContext<'a> {
         }
     }
 
-    /// Publish the KernelStep copy time accumulated in this polling pass.
+    /// Publish the KernelStep copy time accumulated in this polling pass,
+    /// one summary per parent op.
     pub fn flush_kernel_copy(&mut self) {
-        let (bytes, copy_ns, steps) = std::mem::take(&mut self.copy_acc);
-        let Some(rank) = self.copy_rank else {
-            return;
-        };
-        if steps == 0 {
+        if self.copy_acc.is_empty() {
             return;
         }
-        self.pending_telemetry
-            .push_back(Telemetry::KernelCopy(KernelCopySummary {
-                rank,
-                bytes,
-                copy_ns,
-                steps,
-                observed_at: Instant::now(),
-            }));
+        let observed_at = Instant::now();
+        let mut acc: Vec<_> = self.copy_acc.drain().collect();
+        acc.sort_by_key(|(parent, _)| *parent);
+        for (parent, (bytes, copy_ns, steps)) in acc {
+            if steps == 0 {
+                continue;
+            }
+            let identity = self.copy_parents.get(&parent).map(|(p, _)| p.clone());
+            let Some(rank) = identity.as_ref().map(|p| p.rank).or(self.copy_rank) else {
+                continue;
+            };
+            self.pending_telemetry
+                .push_back(Telemetry::KernelCopy(KernelCopySummary {
+                    rank,
+                    bytes,
+                    copy_ns,
+                    steps,
+                    observed_at,
+                    parent: identity,
+                }));
+        }
+    }
+
+    fn remember_copy_parent(&mut self, id: usize, op: &event::NcclOp) {
+        self.copy_parent_gen += 1;
+        let generation = self.copy_parent_gen;
+        self.copy_parents
+            .insert(id, (CopyParent::of(op), generation));
+        self.copy_parent_order.push_back((id, generation));
+        while self.copy_parent_order.len() > COPY_PARENT_CAP {
+            let Some((old, old_gen)) = self.copy_parent_order.pop_front() else {
+                break;
+            };
+            if self.copy_parents.get(&old).map(|(_, g)| *g) == Some(old_gen) {
+                self.copy_parents.remove(&old);
+            }
+        }
     }
 
     fn progress_source_id(source: event::StepProgressSource) -> u8 {
@@ -913,6 +989,7 @@ impl<'a> PollingContext<'a> {
                 let mut op = self.free_ncclop.take_and_free(op);
                 let gid = self.ensure_p2p_parent_group_id(&mut op);
                 self.copy_rank.get_or_insert(op.basic_info().rank());
+                self.remember_copy_parent(id, &op);
                 self.note_ncclop_start(&op);
                 let _ = self.ncclops.insert(id, Box::new(op.clone()));
                 if let Some(gid) = gid {
@@ -1047,9 +1124,10 @@ impl<'a> PollingContext<'a> {
             Message::KernelStep(step, parent) => {
                 if step.is_send && step.size >= KERNEL_COPY_MIN_BYTES && step.end_ts > step.ready_ts
                 {
-                    self.copy_acc.0 += step.size as i64;
-                    self.copy_acc.1 += (step.end_ts - step.ready_ts) as i64;
-                    self.copy_acc.2 += 1;
+                    let acc = self.copy_acc.entry(parent).or_default();
+                    acc.0 += step.size as i64;
+                    acc.1 += (step.end_ts - step.ready_ts) as i64;
+                    acc.2 += 1;
                 }
                 if let Some(ncclop) = self.get_ncclop(parent) {
                     ncclop.add_kernel_step(step);
@@ -1480,6 +1558,8 @@ mod tests {
         match ctx.pending_telemetry.pop_front() {
             Some(Telemetry::KernelCopy(c)) => {
                 assert_eq!((c.bytes, c.copy_ns, c.steps), (196_608, 10_000, 1));
+                // The reclaimed parent's identity still names the op.
+                assert!(c.parent.is_some());
             }
             _ => panic!("expected one KernelCopy summary"),
         }

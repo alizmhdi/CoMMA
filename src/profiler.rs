@@ -1321,6 +1321,11 @@ pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
                     ncclop,
                 );
                 thread_state.send_to_daemon(msg, true);
+                // Publish now: the monitor compares each collective's copy
+                // rate with the same phase in clean iterations, and an
+                // unflushed bulk FIFO held KernelSteps ~1.4s (past a whole
+                // 1.2s training step) until the receiver's fallback refresh.
+                thread_state.fifo.flush();
                 if thread_state.kernel_progress_active.remove(&progress_key) {
                     thread_state.send_ncclop_to_daemon(
                         daemon::Message::StepProgress {
