@@ -24,8 +24,16 @@ use crate::step_tracker::EventStep;
 
 use serde_json::json;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+static NEXT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a stable Group / synthetic P2P-parent id.
+pub fn next_group_id() -> u64 {
+    NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug)]
 pub enum Event {
@@ -34,6 +42,7 @@ pub enum Event {
     NcclOp(usize),
     ProxyOpLite(slab::AllocatedNode<profiler::ProxyOpLocalData>), // Lite == no step tracking
     KernelCh(slab::AllocatedNode<profiler::KernelCh>),
+    KernelStep(slab::AllocatedNode<profiler::KernelStepLocal>),
     ProxyOp(slab::AllocatedNode<profiler::ProxyOpLocalData>),
     Dummy(usize),
     SmallNcclOp(usize),
@@ -109,6 +118,10 @@ pub trait ProfilerEvent {
 #[repr(align(16))]
 pub struct Group {
     basic_info: BasicInfo,
+    id: u64,
+    /// Tokens this rank keeps for itself (AllToAll self-copy). Send-to-self
+    /// and recv-from-self are the same memcpy; stored as max, not sum.
+    self_copy_size: AtomicU64,
 }
 
 impl Group {
@@ -118,7 +131,144 @@ impl Group {
     {
         Self {
             basic_info: BasicInfo::from_descr(descr, time),
+            id: next_group_id(),
+            self_copy_size: AtomicU64::new(0),
         }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn record_self_copy_size(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.self_copy_size
+            .fetch_max(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn self_copy_size(&self) -> usize {
+        self.self_copy_size.load(Ordering::Relaxed) as usize
+    }
+}
+
+/// One communication operation covering every P2P send/recv in an NCCL group.
+///
+/// Emitted as a single top-level `cat: P2P_GROUP` line with child send/recv
+/// nested under `p2ps` (same shape as COLL nesting `proxyops`). `name` is
+/// `all_to_all` (≥2 peers), `sendrecv` (1 peer, both directions), or
+/// `send`/`recv` (one child). Incomplete groups flushed on timeout/shutdown
+/// set `partial`.
+#[derive(Debug, Clone)]
+pub struct P2pParent {
+    pub group_id: u64,
+    pub rank: usize,
+    pub comm_hash: u64,
+    pub start_time: Instant,
+    pub end_time: Instant,
+    pub size: usize,
+    pub n_children: usize,
+    pub n_peers: usize,
+    pub name: &'static str,
+    pub children: Vec<NcclOp>,
+    pub partial: bool,
+    pub self_copy_size: usize,
+}
+
+/// Compact online marker that fixes the final child count of a P2P group.
+/// Child GPU completions are already exported independently; this marker lets
+/// the monitor close their parent without waiting for rich-record reclamation.
+#[derive(Debug, Clone)]
+pub struct P2pGroupSeal {
+    pub group_id: u64,
+    pub n_children: usize,
+    pub observed_at: Instant,
+}
+
+impl P2pGroupSeal {
+    pub fn trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        json!({
+            "ph": "i",
+            "s": "t",
+            "ts": time_to_num(self.observed_at),
+            "dur": 0,
+            "cat": "P2P_GROUP_SEAL",
+            "name": "P2P_GROUP_SEAL",
+            "group_id": self.group_id,
+            "n_children": self.n_children,
+        })
+    }
+}
+
+impl P2pParent {
+    pub fn trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        let mut rec = json!({
+            "ph": "X",
+            "ts": time_to_num(self.start_time),
+            "dur": (self.end_time.saturating_duration_since(self.start_time)).as_micros(),
+            "cat": "P2P_GROUP",
+            "name": self.name,
+            "rank": self.rank,
+            "comm_hash": format!("0x{:016x}", self.comm_hash),
+            "group_id": self.group_id,
+            "n_children": self.n_children,
+            "n_peers": self.n_peers,
+            "args": {
+                "size": self.size,
+                "self_copy_size": self.self_copy_size,
+            },
+        });
+        if self.partial {
+            rec["partial"] = json!(true);
+        }
+        if !self.children.is_empty() {
+            rec["p2ps"] = self
+                .children
+                .iter()
+                .map(|c| c.trace_record(&mut time_to_num))
+                .collect();
+        }
+        rec
+    }
+
+    /// In-flight parent launch. Emitted when the first grouped P2P is issued,
+    /// before NCCL Group stop and before any child completes, so the monitor
+    /// can open one CO while later send/recv starts are still arriving.
+    pub fn issued_trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        let mut rec = json!({
+            "ph": "B",
+            "ts": time_to_num(self.start_time),
+            "dur": 0,
+            "cat": "P2P_GROUP_START",
+            "name": self.name,
+            "rank": self.rank,
+            "comm_hash": format!("0x{:016x}", self.comm_hash),
+            "group_id": self.group_id,
+            "n_children": self.n_children,
+            "n_peers": self.n_peers,
+            "args": {
+                "size": self.size,
+                "self_copy_size": self.self_copy_size,
+            },
+        });
+        if !self.children.is_empty() {
+            rec["p2ps"] = self
+                .children
+                .iter()
+                .map(|c| c.issued_trace_record(&mut time_to_num))
+                .collect();
+        }
+        rec
     }
 }
 
@@ -132,6 +282,135 @@ pub struct NcclOp {
     comm_hash: Option<u64>, // starting from v4 comm_hash is no longer part of the event descriptor
     descr: nccl_metadata::EventMetadata,
     proxyops: Option<Vec<ProxyOp>>,
+    kernel_steps: Option<Vec<KernelEventStep>>,
+    /// Stable NCCL Group id when this op was launched inside ncclGroupStart/End.
+    parent_group_id: Option<u64>,
+}
+
+/// Per-slice KernelStep attached to a Coll/P2p NcclOp.
+/// `peer` is the communicator-local dest rank; NCCL only exports same-host peers.
+#[derive(Debug, Clone)]
+pub struct KernelEventStep {
+    pub channel_id: u8,
+    pub is_send: bool,
+    pub peer: u8,
+    pub step: u32,
+    pub size: u32,
+    /// NCCL `startTs`: wait/step begin; 0 if none/recv.
+    pub start_ts: u64,
+    /// NCCL `readyTs`: transfer/comm begin.
+    pub ready_ts: u64,
+    /// Stop-ring end time (GPU globaltimer).
+    pub end_ts: u64,
+}
+
+/// A compact, standalone step transition emitted while its parent NCCL
+/// operation is still open.  This is intentionally separate from the full
+/// nested trace: the online monitor needs only endpoint identity and the
+/// current stage, while the normal completed record remains unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepProgressStage {
+    Posted,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepProgressSource {
+    Proxy,
+    Kernel,
+    /// GPU-visible channel execution for the parent collective. Unlike a
+    /// KernelStep this has no peer: it exists so local-only collectives can
+    /// arm their end deadline before the channel finishes.
+    KernelCh,
+}
+
+#[derive(Debug, Clone)]
+pub struct StepProgress {
+    pub source: StepProgressSource,
+    pub stage: StepProgressStage,
+    pub observed_at: Instant,
+    pub parent_start: Instant,
+    pub parent_group_id: Option<u64>,
+    pub rank: usize,
+    pub comm_hash: u64,
+    pub seq_num: i64,
+    pub parent_name: String,
+    pub is_send: bool,
+    pub peer: u32,
+    pub channel_id: u8,
+    pub step: i64,
+    pub size: usize,
+}
+
+impl StepProgress {
+    pub fn from_parent(
+        parent: &NcclOp,
+        source: StepProgressSource,
+        stage: StepProgressStage,
+        observed_at: Instant,
+        is_send: bool,
+        peer: u32,
+        channel_id: u8,
+        step: i64,
+        size: usize,
+    ) -> Self {
+        let (parent_name, seq_num) = if let Some(coll) = parent.descr.try_cast_to_coll() {
+            (coll.op_type().name().to_string(), coll.seq_num() as i64)
+        } else {
+            let p2p = parent.descr.try_cast_to_p2p().unwrap();
+            (if p2p.is_send() { "send" } else { "recv" }.to_string(), 0)
+        };
+        Self {
+            source,
+            stage,
+            observed_at,
+            parent_start: parent.basic_info.start_time(),
+            parent_group_id: parent.parent_group_id(),
+            rank: parent.basic_info.rank(),
+            comm_hash: parent.comm_hash(),
+            seq_num,
+            parent_name,
+            is_send,
+            peer,
+            channel_id,
+            step,
+            size,
+        }
+    }
+
+    pub fn trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        let (name, source) = match self.source {
+            StepProgressSource::Proxy => ("ProxyStep", "proxy"),
+            StepProgressSource::Kernel => ("KernelStep", "kernel"),
+            StepProgressSource::KernelCh => ("KernelCh", "kernel_ch"),
+        };
+        let mut json = json!({
+            "ph": if self.stage == StepProgressStage::Posted { "B" } else { "E" },
+            "cat": "STEP_PROGRESS",
+            "name": name,
+            "source": source,
+            "stage": if self.stage == StepProgressStage::Posted { "posted" } else { "complete" },
+            "ts": time_to_num(self.observed_at),
+            "launch_ts": time_to_num(self.parent_start),
+            "rank": self.rank,
+            "comm_hash": format!("0x{:016x}", self.comm_hash),
+            "seq_num": self.seq_num,
+            "parent_name": self.parent_name,
+            "is_send": self.is_send,
+            "peer": self.peer,
+            "channel": self.channel_id,
+            "step": self.step,
+            "size": self.size,
+            "in_flight": self.stage != StepProgressStage::Complete,
+        });
+        if let Some(gid) = self.parent_group_id {
+            json["parent"] = json!(gid);
+        }
+        json
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -257,15 +536,103 @@ impl NcclOp {
             profiler_shim::ncclProfileP2p => true,
             _ => panic!("Unknown ncclop type"),
         };
+        let meta = descr.clone_to_metadata();
+        // v5+/v6 P2P keeps the Group on p2p.parentGroup. parentObj is the
+        // P2pApi handle (often null) and must not be treated as a Group.
+        let parent_group_id = meta
+            .try_cast_to_p2p()
+            .map(|p| event_ffi::peek_group_id(p.parent_group()))
+            .unwrap_or_else(|| event_ffi::peek_group_id(descr.parent_obj()));
         Self {
             basic_info: BasicInfo::from_descr(descr, time),
             is_p2p,
             id,
             child_start_time: None,
             comm_hash: comm_hash_override,
-            descr: descr.clone_to_metadata(),
+            descr: meta,
             proxyops: None,
+            kernel_steps: None,
+            parent_group_id,
         }
+    }
+
+    pub fn parent_group_id(&self) -> Option<u64> {
+        self.parent_group_id
+    }
+
+    pub fn clear_parent_group_id(&mut self) {
+        self.parent_group_id = None;
+    }
+
+    pub fn set_parent_group_id(&mut self, gid: u64) {
+        self.parent_group_id = Some(gid);
+    }
+
+    /// Launch sighting for the monitor end-of-CO clock. Emitted at issue,
+    /// before reclaim, so the detector can arm `launch + duration + margin`.
+    pub fn issued_trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        let basic_info = self.basic_info();
+        let start_time = basic_info.start_time();
+        let mut json = json!({
+            "ph": "B",
+            "ts": time_to_num(start_time),
+            "dur": 0,
+            "cat": if self.is_p2p { "P2P_START" } else { "COLL_START" },
+            "rank": basic_info.rank(),
+            "args": {
+                "size": self.byte_count(),
+            },
+        });
+        json["comm_hash"] = json!(format!("0x{:016x}", self.comm_hash()));
+        if let Some(coll) = self.descr.try_cast_to_coll() {
+            json["name"] = json!(coll.op_type().name());
+            json["seq_num"] = json!(coll.seq_num());
+        } else {
+            let p2p = self.descr.try_cast_to_p2p().unwrap();
+            json["name"] = json!(if p2p.is_send() { "send" } else { "recv" });
+            json["peer"] = json!(p2p.peer());
+            if let Some(gid) = self.parent_group_id {
+                json["parent"] = json!(gid);
+            }
+        }
+        json
+    }
+
+    /// Minimal GPU-visible parent completion. It is emitted immediately from
+    /// KernelCh and excludes nested arrays that need attachment grace.
+    pub fn online_complete_trace_record<F>(&self, mut time_to_num: F) -> serde_json::Value
+    where
+        F: FnMut(Instant) -> u64,
+    {
+        let basic_info = self.basic_info();
+        let start_time = basic_info.start_time();
+        let end_time = basic_info.end_time().unwrap_or(start_time);
+        let mut json = json!({
+            "ph": "X",
+            "ts": time_to_num(start_time),
+            "dur": (end_time - start_time).as_micros(),
+            "cat": if self.is_p2p { "P2P" } else { "COLL" },
+            "rank": basic_info.rank(),
+            "comm_hash": format!("0x{:016x}", self.comm_hash()),
+            "online_complete": true,
+            "args": { "size": self.byte_count() },
+        });
+        if let Some(coll) = self.descr.try_cast_to_coll() {
+            json["name"] = json!(coll.op_type().name());
+            json["seq_num"] = json!(coll.seq_num());
+        } else {
+            let p2p = self.descr.try_cast_to_p2p().unwrap();
+            json["name"] = json!(if p2p.is_send() { "send" } else { "recv" });
+            json["peer"] = json!(p2p.peer());
+            json["is_send"] = json!(p2p.is_send());
+            if let Some(gid) = self.parent_group_id {
+                json["parent"] = json!(gid);
+            }
+        }
+        json
     }
 
     pub fn id(&self) -> usize {
@@ -330,6 +697,20 @@ impl NcclOp {
         }
         self.proxyops.as_mut().unwrap().push(proxyop);
     }
+
+    /// KernelSteps nested under this op (same-host peers only).
+    pub fn kernel_steps(&self) -> &[KernelEventStep] {
+        self.kernel_steps.as_deref().unwrap_or(&[])
+    }
+
+    pub fn add_kernel_step(&mut self, step: KernelEventStep) {
+        // Nest only. Parent Coll/P2p timing is refined by KernelCh / ProxyOp,
+        // not by KernelStep GPU spans.
+        if self.kernel_steps.is_none() {
+            self.kernel_steps = Some(Vec::new());
+        }
+        self.kernel_steps.as_mut().unwrap().push(step);
+    }
 }
 
 impl ProfilerEvent for NcclOp {
@@ -372,11 +753,41 @@ impl ProfilerEvent for NcclOp {
             json["name"] = json!(if p2p.is_send() { "send" } else { "recv" });
             json["peer"] = json!(p2p.peer());
         }
+        if let Some(gid) = self.parent_group_id {
+            json["parent"] = json!(gid);
+        }
 
         if let Some(proxyops) = self.proxyops.as_ref() {
             json["proxyops"] = proxyops
                 .iter()
                 .map(|op| op.trace_record(&mut time_to_num))
+                .collect();
+        }
+
+        if let Some(steps) = self.kernel_steps.as_ref() {
+            json["kernel_steps"] = steps
+                .iter()
+                .map(|s| {
+                    // Same JSON keys as ProxyStep: start_time → fifo_ready_time → end_time.
+                    let start_time = if s.start_ts != 0 {
+                        s.start_ts
+                    } else {
+                        s.ready_ts
+                    };
+                    let mut r = json!({
+                        "channel": s.channel_id,
+                        "is_send": s.is_send,
+                        "peer": s.peer,
+                        "step": s.step,
+                        "size": s.size,
+                        "start_time": start_time,
+                        "end_time": s.end_ts,
+                    });
+                    if s.start_ts != 0 {
+                        r["fifo_ready_time"] = json!(s.ready_ts);
+                    }
+                    r
+                })
                 .collect();
         }
 
@@ -632,5 +1043,144 @@ mod tests {
         basic_info.update_end_time(t1);
         basic_info.update_end_time(t0);
         assert_eq!(basic_info.end_time(), Some(t1));
+    }
+
+    #[test]
+    fn kernel_steps_nested_without_refining_parent_duration() {
+        let start = Instant::now();
+        let mut descr: profiler_shim::ncclProfilerEventDescr_v4_t = unsafe { std::mem::zeroed() };
+        descr.type_ = profiler_shim::ncclProfileColl as _;
+        let mut op = NcclOp {
+            basic_info: BasicInfo {
+                rank: 0,
+                start_time: start,
+                end_time: None,
+            },
+            id: 0,
+            is_p2p: false,
+            child_start_time: None,
+            comm_hash: Some(0x123),
+            descr: nccl_metadata::EventMetadata::V4(profiler_shim::EventDescrV4(descr)),
+            proxyops: None,
+            kernel_steps: None,
+            parent_group_id: None,
+        };
+
+        op.add_kernel_step(KernelEventStep {
+            channel_id: 0,
+            is_send: true,
+            peer: 0,
+            step: 1,
+            size: 4,
+            start_ts: 1_000_000 - 2_000, // wait begin
+            ready_ts: 1_000_000,         // transfer begin
+            end_ts: 1_000_000 + 5_000,   // 5 us transfer
+        });
+        op.add_kernel_step(KernelEventStep {
+            channel_id: 0,
+            is_send: false,
+            peer: 0,
+            step: 1,
+            size: 4,
+            start_ts: 0,
+            ready_ts: 1_000_000 + 1_000,
+            end_ts: 1_000_000 + 12_000,
+        });
+
+        assert!(
+            op.basic_info.end_time().is_none(),
+            "KernelSteps must not refine parent end_time (KernelCh/ProxyOp do)"
+        );
+        assert_eq!(op.child_start_time(), None);
+
+        let rec = op.trace_record(|_| 0);
+        let ks = rec["kernel_steps"].as_array().expect("kernel_steps");
+        assert_eq!(ks.len(), 2);
+        assert_eq!(ks[0]["start_time"], 1_000_000 - 2_000);
+        assert_eq!(ks[0]["fifo_ready_time"], 1_000_000);
+        assert_eq!(ks[0]["end_time"], 1_000_000 + 5_000);
+        assert!(ks[1].get("fifo_ready_time").is_none());
+        assert_eq!(ks[1]["start_time"], 1_000_000 + 1_000);
+        assert_eq!(ks[1]["end_time"], 1_000_000 + 12_000);
+    }
+
+    #[test]
+    fn p2p_parent_emits_p2p_group() {
+        let start = Instant::now();
+        let parent = P2pParent {
+            group_id: 7,
+            rank: 1,
+            comm_hash: 0xabc,
+            start_time: start,
+            end_time: start + Duration::from_micros(250),
+            size: 4096,
+            n_children: 6,
+            n_peers: 3,
+            name: "all_to_all",
+            children: Vec::new(),
+            partial: false,
+            self_copy_size: 257_536,
+        };
+        let rec = parent.trace_record(|_| 42);
+        assert_eq!(rec["cat"], "P2P_GROUP");
+        assert_eq!(rec["name"], "all_to_all");
+        assert_eq!(rec["group_id"], 7);
+        assert_eq!(rec["n_children"], 6);
+        assert_eq!(rec["n_peers"], 3);
+        assert_eq!(rec["comm_hash"], "0x0000000000000abc");
+        assert_eq!(rec["args"]["size"], 4096);
+        assert_eq!(rec["args"]["self_copy_size"], 257_536);
+        assert_eq!(rec["dur"], 250);
+        assert!(rec.get("p2ps").is_none());
+        assert!(rec.get("partial").is_none());
+
+        let start_rec = parent.issued_trace_record(|_| 7);
+        assert_eq!(start_rec["cat"], "P2P_GROUP_START");
+        assert_eq!(start_rec["ph"], "B");
+        assert_eq!(start_rec["dur"], 0);
+        assert_eq!(start_rec["ts"], 7);
+        assert_eq!(start_rec["group_id"], 7);
+        assert!(start_rec.get("p2ps").is_none());
+    }
+
+    fn live_group_handle() -> (*mut libc::c_void, u64) {
+        use crate::event_ffi::AsFFI as _;
+        let group_descr = profiler_shim::tests::dummy_group_descr();
+        let event = Event::new_group(&group_descr, Instant::now());
+        let Event::Group(ref group) = event else {
+            panic!("expected Group");
+        };
+        let id = group.id();
+        (event.into_ffi(), id)
+    }
+
+    #[test]
+    fn from_descr_v6_peeks_p2p_parent_group_not_parent_obj() {
+        use crate::event_ffi::AsFFI as _;
+        let (handle, want) = live_group_handle();
+        let mut descr: profiler_shim::ncclProfilerEventDescr_v6_t = unsafe { std::mem::zeroed() };
+        descr.type_ = profiler_shim::ncclProfileP2p as _;
+        descr.parentObj = std::ptr::null_mut();
+        descr.__bindgen_anon_1.p2p.parentGroup = handle;
+        let op = NcclOp::from_descr(&profiler_shim::EventDescrV6(descr), Instant::now(), 0, None);
+        assert_eq!(op.parent_group_id(), Some(want));
+        let _ = unsafe { Event::from_ffi(handle) };
+    }
+
+    #[test]
+    fn from_descr_v4_still_peeks_parent_obj() {
+        use crate::event_ffi::AsFFI as _;
+        let (handle, want) = live_group_handle();
+        let mut descr: profiler_shim::ncclProfilerEventDescr_v4_t = unsafe { std::mem::zeroed() };
+        descr.type_ = profiler_shim::ncclProfileP2p as _;
+        descr.parentObj = handle;
+        let op = NcclOp::from_descr(&profiler_shim::EventDescrV4(descr), Instant::now(), 0, None);
+        assert_eq!(op.parent_group_id(), Some(want));
+        let rec = op.issued_trace_record(|_| 42);
+        assert_eq!(rec["cat"], "P2P_START");
+        assert_eq!(rec["dur"], 0);
+        assert_eq!(rec["ts"], 42);
+        assert!(rec.get("parent").is_none());
+        let _ = unsafe { Event::from_ffi(handle) };
     }
 }

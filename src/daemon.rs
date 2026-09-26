@@ -16,6 +16,7 @@ use crate::event;
 use crate::event::ProfilerEvent as _;
 use crate::fixed_batch;
 use crate::nccl_metadata;
+use crate::nccl_metadata::P2p as _;
 use crate::profiler;
 use crate::profiler::Communicator;
 use crate::profiler::Profiler;
@@ -26,7 +27,7 @@ use crate::step_tracker::EventStep;
 
 use log::error;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -118,6 +119,8 @@ impl<T> FifoReceiver<T> {
 #[derive(Debug)]
 pub enum ControlMessage {
     NewThread(ThreadControl),
+    /// Apply runtime gate update (also used by tests / future IPC).
+    SetGates(crate::runtime_gates::GateUpdate),
 }
 
 #[derive(Debug)]
@@ -141,7 +144,20 @@ pub enum Message {
         /* duration ns */ u64,
         /* parent handle */ usize,
     ),
+    KernelStep(event::KernelEventStep, /* parent handle */ usize),
+    StepProgress {
+        source: event::StepProgressSource,
+        stage: event::StepProgressStage,
+        observed_at: Instant,
+        parent: usize,
+        is_send: bool,
+        peer: u32,
+        channel_id: u8,
+        step: i64,
+        size: usize,
+    },
     CommOpen(Communicator),
+    CommInit(crate::profiler::CommMembership),
     CommClose(/* comm_hash = */ u64),
 }
 
@@ -161,6 +177,19 @@ pub enum InterProcessMessage {
 pub const STEP_BATCH_SZ: usize = 64;
 pub type StepBatch = fixed_batch::Batch<EventStep, STEP_BATCH_SZ>;
 
+type PendingProgress = (
+    event::StepProgressSource,
+    event::StepProgressStage,
+    Instant,
+    bool,
+    u32,
+    u8,
+    i64,
+    usize,
+);
+
+type ActiveProgressKey = (usize, u8, bool, u32, u8);
+
 /// This separate Telemetry type should make a copy of the Message type.
 /// Doing so decouples:
 ///   1. event management of those shared profiler API handler,
@@ -169,10 +198,95 @@ pub type StepBatch = fixed_batch::Batch<EventStep, STEP_BATCH_SZ>;
 pub enum Telemetry {
     Group(Box<event::Group>),
     NcclOpIssued(Box<event::NcclOp>), // copybara:strip(hang detection)
+    /// Compact GPU completion, independent of delayed child attachment.
+    NcclOpComplete(Box<event::NcclOp>),
     NcclOp(Box<event::NcclOp>),
+    /// In-flight grouped P2P parent, emitted at first child issue.
+    P2pParentStart(Box<event::P2pParent>),
+    /// Compact final-child-count marker emitted at NCCL Group stop.
+    P2pGroupSeal(event::P2pGroupSeal),
+    P2pParent(Box<event::P2pParent>),
+    StepProgress(event::StepProgress),
     ProxyOp(Box<event::ProxyOp>),
     CommOpen(Communicator),
+    CommInit(crate::profiler::CommMembership),
     CommClose(/* comm_hash = */ u64),
+    /// Same-host GPU copy summary of one parent op's KernelSteps processed in
+    /// one polling pass, independent of whether that op is still tracked.
+    KernelCopy(KernelCopySummary),
+}
+
+/// Smallest KernelStep counted toward the copy-bandwidth summary.
+pub const KERNEL_COPY_MIN_BYTES: u32 = 65_536;
+
+/// Parent ops whose identity is kept for late KernelSteps.
+const COPY_PARENT_CAP: usize = 16_384;
+
+/// Identity of a KernelStep's parent op, the same fields its online progress
+/// carries. Kept after the op is reclaimed: bulk-FIFO KernelSteps can arrive
+/// later.
+#[derive(Debug, Clone)]
+pub struct CopyParent {
+    pub rank: usize,
+    pub comm_hash: u64,
+    pub seq_num: i64,
+    pub group_id: Option<u64>,
+    pub parent_name: String,
+    pub parent_start: Instant,
+}
+
+impl CopyParent {
+    fn of(op: &event::NcclOp) -> Self {
+        let p = event::StepProgress::from_parent(
+            op,
+            event::StepProgressSource::Kernel,
+            event::StepProgressStage::Complete,
+            op.basic_info().start_time(),
+            true,
+            0,
+            0,
+            0,
+            0,
+        );
+        Self {
+            rank: p.rank,
+            comm_hash: p.comm_hash,
+            seq_num: p.seq_num,
+            group_id: p.parent_group_id,
+            parent_name: p.parent_name,
+            parent_start: p.parent_start,
+        }
+    }
+}
+
+/// `bytes` of send KernelSteps copied in `copy_ns` of GPU time
+/// (`end_ts - ready_ts`, credit wait excluded) across `steps` steps, all of
+/// one parent op (`parent`, when its identity is still known).
+#[derive(Debug, Clone)]
+pub struct KernelCopySummary {
+    pub rank: usize,
+    pub bytes: i64,
+    pub copy_ns: i64,
+    pub steps: u32,
+    pub observed_at: Instant,
+    pub parent: Option<CopyParent>,
+}
+
+/// Accumulator for P2Ps that share one NCCL Group. Native COLLs in the same
+/// group are emitted on their own; P2Ps wait here and nest under P2P_GROUP.
+#[derive(Default)]
+struct P2pGroupAcc {
+    expected: usize,
+    ended: bool,
+    /// NCCL Group-stop callback time, captured before entering the daemon.
+    /// This is the semantic seal time even if export is briefly backlogged.
+    ended_at: Option<Instant>,
+    /// True after the in-flight `P2P_GROUP_START` has been exported.
+    start_emitted: bool,
+    /// True after the compact group-stop marker has been exported.
+    seal_emitted: bool,
+    children: Vec<Box<event::NcclOp>>,
+    self_copy_size: usize,
 }
 
 pub struct PollingContext<'a> {
@@ -180,6 +294,16 @@ pub struct PollingContext<'a> {
     pub ncclops: BTreeMap<usize, Box<event::NcclOp>>,
     pub pending_telemetry: VecDeque<Telemetry>,
     stop: Arc<AtomicBool>,
+    /// KernelStep copy time accumulated per parent op since the last flush.
+    /// Parent ops can be reclaimed before their (bulk-FIFO) KernelSteps
+    /// arrive, so the summary must not depend on attaching steps to a live op.
+    copy_acc: HashMap<usize, (i64, i64, u32)>,
+    copy_rank: Option<usize>,
+    /// Identity of recently registered parent ops, with a generation so a
+    /// reused op id evicts only its own older entry.
+    copy_parents: HashMap<usize, (CopyParent, u64)>,
+    copy_parent_order: VecDeque<(usize, u64)>,
+    copy_parent_gen: u64,
 
     free_ncclop: slab::FreeList<event::NcclOp>,
     free_proxyop: slab::FreeList<event::ProxyOp>,
@@ -187,6 +311,21 @@ pub struct PollingContext<'a> {
 
     peer_rank_fifo: HashMap<libc::pid_t, shm_fifo::mpsc::Sender<InterProcessMessage>>,
     pending_ipc_msg: HashMap<libc::pid_t, VecDeque<InterProcessMessage>>,
+    p2p_groups: HashMap<u64, P2pGroupAcc>,
+    /// One compact, live progress marker per NCCL parent/source/direction/
+    /// peer/channel. Raw step callbacks can number in the thousands; the
+    /// monitor needs the current in-flight endpoint, not every completed
+    /// micro-step.
+    active_progress: HashMap<ActiveProgressKey, event::StepProgress>,
+    /// KernelCh and its parent operation can be delivered by different NCCL
+    /// threads. Preserve a completion that wins that race until the launch
+    /// record arrives instead of losing the end-of-collective signal.
+    early_completions: HashMap<usize, (Instant, Instant)>,
+    /// Progress callbacks can race ahead of their parent launch because NCCL
+    /// invokes profiler callbacks from several threads. Preserve the compact
+    /// transition and replay it as soon as the parent is registered.
+    early_progress: HashMap<usize, Vec<PendingProgress>>,
+    online_completed: HashSet<usize>,
 }
 
 impl<'a> PollingContext<'a> {
@@ -196,17 +335,411 @@ impl<'a> PollingContext<'a> {
             ncclops: BTreeMap::new(),
             pending_telemetry: VecDeque::new(),
             stop: stop_signal,
+            copy_acc: HashMap::new(),
+            copy_rank: None,
+            copy_parents: HashMap::new(),
+            copy_parent_order: VecDeque::new(),
+            copy_parent_gen: 0,
             free_ncclop: slab::FreeList::default(),
             free_proxyop: slab::FreeList::default(),
             free_step_batch: slab::FreeList::default(),
             peer_rank_fifo: HashMap::new(),
             pending_ipc_msg: HashMap::new(),
+            p2p_groups: HashMap::new(),
+            active_progress: HashMap::new(),
+            early_completions: HashMap::new(),
+            early_progress: HashMap::new(),
+            online_completed: HashSet::new(),
         }
     }
 
-    fn reclaim_ncclop(&mut self, op: event::NcclOp) {
+    /// Publish the KernelStep copy time accumulated in this polling pass,
+    /// one summary per parent op.
+    pub fn flush_kernel_copy(&mut self) {
+        if self.copy_acc.is_empty() {
+            return;
+        }
+        let observed_at = Instant::now();
+        let mut acc: Vec<_> = self.copy_acc.drain().collect();
+        acc.sort_by_key(|(parent, _)| *parent);
+        for (parent, (bytes, copy_ns, steps)) in acc {
+            if steps == 0 {
+                continue;
+            }
+            let identity = self.copy_parents.get(&parent).map(|(p, _)| p.clone());
+            let Some(rank) = identity.as_ref().map(|p| p.rank).or(self.copy_rank) else {
+                continue;
+            };
+            self.pending_telemetry
+                .push_back(Telemetry::KernelCopy(KernelCopySummary {
+                    rank,
+                    bytes,
+                    copy_ns,
+                    steps,
+                    observed_at,
+                    parent: identity,
+                }));
+        }
+    }
+
+    fn remember_copy_parent(&mut self, id: usize, op: &event::NcclOp) {
+        self.copy_parent_gen += 1;
+        let generation = self.copy_parent_gen;
+        self.copy_parents
+            .insert(id, (CopyParent::of(op), generation));
+        self.copy_parent_order.push_back((id, generation));
+        while self.copy_parent_order.len() > COPY_PARENT_CAP {
+            let Some((old, old_gen)) = self.copy_parent_order.pop_front() else {
+                break;
+            };
+            if self.copy_parents.get(&old).map(|(_, g)| *g) == Some(old_gen) {
+                self.copy_parents.remove(&old);
+            }
+        }
+    }
+
+    fn progress_source_id(source: event::StepProgressSource) -> u8 {
+        match source {
+            event::StepProgressSource::Proxy => 0,
+            event::StepProgressSource::Kernel => 1,
+            event::StepProgressSource::KernelCh => 2,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn note_step_progress(
+        &mut self,
+        source: event::StepProgressSource,
+        stage: event::StepProgressStage,
+        observed_at: Instant,
+        parent: usize,
+        is_send: bool,
+        peer: u32,
+        channel_id: u8,
+        step: i64,
+        size: usize,
+    ) {
+        // A cross-thread posted callback can arrive after KernelCh. Never
+        // resurrect progress for a collective already closed.
+        if self.online_completed.contains(&parent) {
+            return;
+        }
+        let key = (
+            parent,
+            Self::progress_source_id(source),
+            is_send,
+            peer,
+            channel_id,
+        );
+        if !self.ncclops.contains_key(&parent) {
+            let pending = self.early_progress.entry(parent).or_default();
+            if !pending.iter().any(|(s, st, _, send, p, ch, _, _)| {
+                *s == source && *st == stage && *send == is_send && *p == peer && *ch == channel_id
+            }) {
+                pending.push((
+                    source,
+                    stage,
+                    observed_at,
+                    is_send,
+                    peer,
+                    channel_id,
+                    step,
+                    size,
+                ));
+            }
+            return;
+        }
+        if stage == event::StepProgressStage::Complete {
+            if let Some(mut progress) = self.active_progress.remove(&key) {
+                progress.stage = event::StepProgressStage::Complete;
+                progress.observed_at = observed_at;
+                progress.step = step;
+                progress.size = size;
+                self.pending_telemetry
+                    .push_back(Telemetry::StepProgress(progress));
+            }
+            return;
+        }
+        if self.active_progress.contains_key(&key) {
+            return;
+        }
+        let Some(ncclop) = self.get_ncclop(parent) else {
+            return;
+        };
+        let progress = event::StepProgress::from_parent(
+            ncclop,
+            source,
+            stage,
+            observed_at,
+            is_send,
+            peer,
+            channel_id,
+            step,
+            size,
+        );
+        self.active_progress.insert(key, progress.clone());
         self.pending_telemetry
-            .push_back(Telemetry::NcclOp(Box::new(op)));
+            .push_back(Telemetry::StepProgress(progress));
+    }
+
+    fn finish_parent_progress(&mut self, parent: usize, observed_at: Instant) {
+        let keys: Vec<_> = self
+            .active_progress
+            .keys()
+            .filter(|(p, _, _, _, _)| *p == parent)
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(mut progress) = self.active_progress.remove(&key) {
+                progress.stage = event::StepProgressStage::Complete;
+                progress.observed_at = observed_at;
+                self.pending_telemetry
+                    .push_back(Telemetry::StepProgress(progress));
+            }
+        }
+    }
+
+    fn complete_ncclop(&mut self, parent: usize, child_start: Instant, end_time: Instant) {
+        if self.online_completed.contains(&parent) {
+            return;
+        }
+
+        let Some(ncclop) = self.get_ncclop(parent) else {
+            self.early_completions
+                .entry(parent)
+                .and_modify(|(start, end)| {
+                    *start = (*start).min(child_start);
+                    *end = (*end).max(end_time);
+                })
+                .or_insert((child_start, end_time));
+            return;
+        };
+        ncclop_update(ncclop, child_start, Some(end_time));
+        let completed = ncclop.clone();
+
+        self.online_completed.insert(parent);
+        self.finish_parent_progress(parent, end_time);
+        self.pending_telemetry
+            .push_back(Telemetry::NcclOpComplete(Box::new(completed)));
+    }
+
+    /// Every online P2P belongs to a parent group. NCCL-grouped send/recv keep
+    /// their Group id. Standalone P2Ps get a synthetic id so the monitor never
+    /// has to reconstruct parents from child timestamps.
+    fn ensure_p2p_parent_group_id(&mut self, op: &mut event::NcclOp) -> Option<u64> {
+        if !op.is_p2p() {
+            return None;
+        }
+        if let Some(gid) = op.parent_group_id() {
+            return Some(gid);
+        }
+        let gid = event::next_group_id();
+        op.set_parent_group_id(gid);
+        // No ncclGroupEnd arrives for a synthetic one-child parent.
+        let acc = self.p2p_groups.entry(gid).or_default();
+        acc.ended = true;
+        acc.ended_at = Some(op.basic_info().start_time());
+        Some(gid)
+    }
+
+    fn note_ncclop_start(&mut self, op: &event::NcclOp) {
+        if !op.is_p2p() {
+            return;
+        }
+        let Some(gid) = op.parent_group_id() else {
+            return;
+        };
+        self.p2p_groups.entry(gid).or_default().expected += 1;
+    }
+
+    /// Export one parent start as soon as the first child is issued.
+    /// Later children keep their own `P2P_START` records; Group stop is not
+    /// required and must not delay this online launch signal.
+    fn emit_p2p_group_start(&mut self, gid: u64) {
+        let Some(acc) = self.p2p_groups.get(&gid) else {
+            return;
+        };
+        if acc.start_emitted {
+            return;
+        }
+        let self_copy_size = acc.self_copy_size;
+        let mut children: Vec<event::NcclOp> = self
+            .ncclops
+            .values()
+            .filter(|op| op.is_p2p() && op.parent_group_id() == Some(gid))
+            .map(|op| op.as_ref().clone())
+            .collect();
+        if children.is_empty() {
+            return;
+        }
+        children.sort_by_key(|c| (c.basic_info().start_time(), c.id()));
+        let (name, n_peers, send_bytes, start, rank, comm_hash) =
+            Self::summarize_p2p_children(&children);
+        if let Some(acc) = self.p2p_groups.get_mut(&gid) {
+            acc.start_emitted = true;
+        }
+        self.pending_telemetry
+            .push_back(Telemetry::P2pParentStart(Box::new(event::P2pParent {
+                group_id: gid,
+                rank,
+                comm_hash,
+                start_time: start,
+                end_time: start,
+                size: send_bytes,
+                n_children: children.len(),
+                n_peers,
+                name,
+                children,
+                partial: false,
+                self_copy_size,
+            })));
+    }
+
+    fn emit_p2p_group_seal(&mut self, gid: u64) {
+        let Some(acc) = self.p2p_groups.get_mut(&gid) else {
+            return;
+        };
+        if !acc.ended || acc.expected == 0 || acc.seal_emitted {
+            return;
+        }
+        acc.seal_emitted = true;
+        self.pending_telemetry
+            .push_back(Telemetry::P2pGroupSeal(event::P2pGroupSeal {
+                group_id: gid,
+                n_children: acc.expected,
+                observed_at: acc.ended_at.unwrap_or_else(Instant::now),
+            }));
+    }
+
+    fn summarize_p2p_children(
+        children: &[event::NcclOp],
+    ) -> (&'static str, usize, usize, Instant, usize, u64) {
+        let start = children
+            .iter()
+            .map(|c| c.basic_info().start_time())
+            .min()
+            .unwrap_or_else(Instant::now);
+        let mut peers = HashSet::new();
+        let mut n_send = 0usize;
+        let mut n_recv = 0usize;
+        let mut send_bytes = 0usize;
+        for c in children {
+            if let Some(p2p) = c.get_descr().try_cast_to_p2p() {
+                peers.insert(p2p.peer());
+                if p2p.is_send() {
+                    n_send += 1;
+                    send_bytes = send_bytes.saturating_add(c.byte_count());
+                } else {
+                    n_recv += 1;
+                }
+            }
+        }
+        let name = if peers.len() >= 2 {
+            "all_to_all"
+        } else if n_send > 0 && n_recv > 0 {
+            "sendrecv"
+        } else if n_send > 0 {
+            "send"
+        } else {
+            "recv"
+        };
+        let rank = children.first().map(|c| c.basic_info().rank()).unwrap_or(0);
+        let comm_hash = children.first().map(|c| c.comm_hash()).unwrap_or(0);
+        (name, peers.len(), send_bytes, start, rank, comm_hash)
+    }
+
+    fn group_has_inflight(&self, gid: u64) -> bool {
+        self.ncclops
+            .values()
+            .any(|op| op.is_p2p() && op.parent_group_id() == Some(gid))
+    }
+
+    fn try_emit_p2p_parent(&mut self, gid: u64, force: bool) {
+        let (n_children, ended, expected) = match self.p2p_groups.get(&gid) {
+            Some(g) => (g.children.len(), g.ended, g.expected),
+            None => return,
+        };
+        let ready = n_children > 0
+            && (force || (ended && n_children >= expected && !self.group_has_inflight(gid)));
+        if !ready {
+            return;
+        }
+        let g = self.p2p_groups.remove(&gid).unwrap();
+        let partial = force && (g.children.len() < g.expected || !g.ended);
+        self.emit_p2p_group(gid, g.children, partial, g.self_copy_size);
+    }
+
+    fn emit_p2p_group(
+        &mut self,
+        gid: u64,
+        children: Vec<Box<event::NcclOp>>,
+        partial: bool,
+        self_copy_size: usize,
+    ) {
+        let mut children: Vec<event::NcclOp> = children.into_iter().map(|b| *b).collect();
+        children.sort_by_key(|c| (c.basic_info().start_time(), c.id()));
+        for c in &mut children {
+            c.clear_parent_group_id();
+        }
+        let end = children
+            .iter()
+            .filter_map(|c| c.basic_info().end_time())
+            .max();
+        let (name, n_peers, send_bytes, start, rank, comm_hash) =
+            Self::summarize_p2p_children(&children);
+        self.pending_telemetry
+            .push_back(Telemetry::P2pParent(Box::new(event::P2pParent {
+                group_id: gid,
+                rank,
+                comm_hash,
+                start_time: start,
+                end_time: end.filter(|t| *t > start).unwrap_or(start),
+                size: send_bytes,
+                n_children: children.len(),
+                n_peers,
+                name,
+                children,
+                partial,
+                self_copy_size,
+            })));
+    }
+
+    fn flush_p2p_parents(&mut self) {
+        let gids: Vec<u64> = self.p2p_groups.keys().copied().collect();
+        for gid in gids {
+            self.try_emit_p2p_parent(gid, true);
+        }
+    }
+
+    fn reclaim_ncclop(&mut self, mut op: event::NcclOp) {
+        self.finish_parent_progress(
+            op.id(),
+            op.basic_info().end_time().unwrap_or_else(Instant::now),
+        );
+        if !op.is_p2p() {
+            self.pending_telemetry
+                .push_back(Telemetry::NcclOp(Box::new(op)));
+            return;
+        }
+        match op.parent_group_id() {
+            Some(gid) => {
+                self.p2p_groups
+                    .entry(gid)
+                    .or_default()
+                    .children
+                    .push(Box::new(op));
+                self.try_emit_p2p_parent(gid, false);
+            }
+            None => {
+                // Should not happen once ensure_p2p_parent_group_id runs at issue.
+                let gid = event::next_group_id();
+                op.set_parent_group_id(gid);
+                let acc = self.p2p_groups.entry(gid).or_default();
+                acc.ended = true;
+                acc.children.push(Box::new(op));
+                self.try_emit_p2p_parent(gid, true);
+            }
+        }
     }
 
     fn get_ncclop(&mut self, id: usize) -> Option<&mut event::NcclOp> {
@@ -337,12 +870,17 @@ impl<'a> PollingContext<'a> {
         // 1. we know the parent (and therefore comm hash)
         // 2. this proxyop is originated from current process OR
         //    we are tracking interprocess proxyop
+        // Prefer runtime gates (comma-monitor mid-flight enable) over the
+        // process-start Config snapshot.
+        let gates = &self.profiler.gates;
+        let track_steps = gates.track_steps();
+        let aggregate_cfg = gates.aggregate_steps();
+        let track_interprocess = gates.track_interprocess_proxyop();
         if info.parent().is_some() {
-            aggregate_steps = self.profiler.config.aggregate_steps
-                && (info.pid == self.profiler.pid
-                    || self.profiler.config.track_interprocess_proxyop);
+            aggregate_steps =
+                aggregate_cfg && (info.pid == self.profiler.pid || track_interprocess);
         }
-        op.init_step_tracking(self.profiler.config.track_steps, aggregate_steps);
+        op.init_step_tracking(track_steps, aggregate_steps);
         self.handle_proxyop_start(thread_state, info, op.basic_info().start_time());
 
         thread_state.proxyops.insert(id, op);
@@ -388,8 +926,11 @@ impl<'a> PollingContext<'a> {
         proxyops: Vec<Box<event::ProxyOp>>,
         send_ipc: bool,
     ) {
-        let config = &self.profiler.config;
-        let record_proxyop = config.track_proxyop || config.track_steps;
+        // Runtime gates: when the monitor escalates after an anomaly, newly
+        // completed ProxyOps must be attached to the parent COLL JSON even
+        // though process-start Config still has track_proxyop/steps=false.
+        let gates = &self.profiler.gates;
+        let record_proxyop = gates.track_proxyop() || gates.track_steps();
         if let Some(parent_handle) = info.parent() {
             if info.pid == self.profiler.pid {
                 if let Some(ncclop) = self.get_ncclop(parent_handle) {
@@ -432,18 +973,54 @@ impl<'a> PollingContext<'a> {
     {
         match msg {
             Message::Group(group) => {
+                let gid = group.id();
+                let acc = self.p2p_groups.entry(gid).or_default();
+                acc.ended = true;
+                acc.ended_at = group.basic_info().end_time();
+                acc.self_copy_size = acc.self_copy_size.max(group.self_copy_size());
+                self.emit_p2p_group_seal(gid);
+                self.try_emit_p2p_parent(gid, false);
                 if self.profiler.config.track_group {
                     self.pending_telemetry.push_back(Telemetry::Group(group));
                 }
             }
             Message::NcclOp(op) => {
                 let id = op.id();
-                let op = self.free_ncclop.take_and_free(op);
+                let mut op = self.free_ncclop.take_and_free(op);
+                let gid = self.ensure_p2p_parent_group_id(&mut op);
+                self.copy_rank.get_or_insert(op.basic_info().rank());
+                self.remember_copy_parent(id, &op);
+                self.note_ncclop_start(&op);
                 let _ = self.ncclops.insert(id, Box::new(op.clone()));
+                if let Some(gid) = gid {
+                    self.emit_p2p_group_start(gid);
+                    // A standalone P2P uses a synthetic group and receives no
+                    // later NCCL Group-stop callback.
+                    self.emit_p2p_group_seal(gid);
+                }
                 // copybara:strip_begin(hang detection)
                 self.pending_telemetry
                     .push_back(Telemetry::NcclOpIssued(Box::new(op)));
                 // copybara:strip_end
+                if let Some(progress) = self.early_progress.remove(&id) {
+                    for (source, stage, observed_at, is_send, peer, channel, step, size) in progress
+                    {
+                        self.note_step_progress(
+                            source,
+                            stage,
+                            observed_at,
+                            id,
+                            is_send,
+                            peer,
+                            channel,
+                            step,
+                            size,
+                        );
+                    }
+                }
+                if let Some((child_start, end_time)) = self.early_completions.remove(&id) {
+                    self.complete_ncclop(id, child_start, end_time);
+                }
                 if self.free_ncclop.num_free() >= slab::FREELIST_BATCH {
                     self.free_ncclop.try_publish(&self.profiler.free_ncclop);
                 }
@@ -541,16 +1118,50 @@ impl<'a> PollingContext<'a> {
                 }
             }
             Message::KernelCh(start_time, duration, parent) => {
-                if let Some(ncclop) = self.get_ncclop(parent) {
-                    ncclop_update(
-                        ncclop,
-                        start_time,
-                        Some(start_time + Duration::from_nanos(duration)),
-                    );
+                let end_time = start_time + Duration::from_nanos(duration);
+                self.complete_ncclop(parent, start_time, end_time);
+            }
+            Message::KernelStep(step, parent) => {
+                if step.is_send && step.size >= KERNEL_COPY_MIN_BYTES && step.end_ts > step.ready_ts
+                {
+                    let acc = self.copy_acc.entry(parent).or_default();
+                    acc.0 += step.size as i64;
+                    acc.1 += (step.end_ts - step.ready_ts) as i64;
+                    acc.2 += 1;
                 }
+                if let Some(ncclop) = self.get_ncclop(parent) {
+                    ncclop.add_kernel_step(step);
+                }
+            }
+            Message::StepProgress {
+                source,
+                stage,
+                observed_at,
+                parent,
+                is_send,
+                peer,
+                channel_id,
+                step,
+                size,
+            } => {
+                self.note_step_progress(
+                    source,
+                    stage,
+                    observed_at,
+                    parent,
+                    is_send,
+                    peer,
+                    channel_id,
+                    step,
+                    size,
+                );
             }
             Message::CommOpen(comm) => {
                 self.pending_telemetry.push_back(Telemetry::CommOpen(comm));
+            }
+            Message::CommInit(membership) => {
+                self.pending_telemetry
+                    .push_back(Telemetry::CommInit(membership));
             }
             Message::CommClose(comm_hash) => {
                 self.pending_telemetry
@@ -698,6 +1309,7 @@ fn ipc_shm_path(pid: libc::pid_t) -> String {
 
 const FIFO_FETCH_INTERVAL: Duration = Duration::from_secs(1);
 const FIFO_PROCESS_BATCH: usize = 512;
+const ONLINE_FIFO_PROCESS_BATCH: usize = profiler::EVENT_QUEUE_SZ;
 const FIFO_RECV_BATCH: usize = profiler::EVENT_QUEUE_SZ;
 const IPC_RECV_BATCH: usize = 512;
 const IPC_SEND_BATCH: usize = 64;
@@ -731,6 +1343,9 @@ where
                     ctrl.daemon_state.idx = threads.len();
                     threads.push(ctrl);
                 }
+                ControlMessage::SetGates(update) => {
+                    let _ = ctx.profiler.gates.apply_update(&update);
+                }
             }
         }
 
@@ -757,9 +1372,11 @@ where
             thread
                 .ncclop_fifo
                 .recv_many(FIFO_FETCH_INTERVAL, FIFO_RECV_BATCH, n_recv > 0);
-            thread.ncclop_fifo.process_many(FIFO_PROCESS_BATCH, |msg| {
-                ctx.handle_fifo_message(msg, &mut thread.daemon_state, &mut exporter);
-            });
+            thread
+                .ncclop_fifo
+                .process_many(ONLINE_FIFO_PROCESS_BATCH, |msg| {
+                    ctx.handle_fifo_message(msg, &mut thread.daemon_state, &mut exporter);
+                });
         }
 
         for thread in threads.iter_mut() {
@@ -841,6 +1458,7 @@ where
             });
         }
 
+        ctx.flush_kernel_copy();
         exporter.export(ctx, None)
     }
 
@@ -867,6 +1485,347 @@ where
     }
 
     ctx.reclaim_all_ncclops_in_map();
+    ctx.flush_p2p_parents();
 
-    exporter.export(ctx, Some(RETRY_MS));
+    // Shutdown may reclaim more records than the bounded Tokio channels can
+    // accept in one pass. Keep draining until every final trace has actually
+    // crossed into the exporter; otherwise categories disappear depending on
+    // queue timing.
+    while !ctx.pending_telemetry.is_empty() {
+        exporter.export(ctx, Some(RETRY_MS));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profiler::Version;
+    use crate::profiler_shim;
+
+    struct NoopExport;
+
+    impl Export for NoopExport {
+        fn export(&self, _ctx: &mut PollingContext, _maybe_retry_ms: Option<u64>) {}
+    }
+
+    fn coll(id: usize, start: Instant) -> slab::AllocatedNode<event::NcclOp> {
+        let descr = profiler_shim::tests::dummy_coll_descr();
+        slab::AllocatedNode::new(event::NcclOp::from_descr(&descr, start, id, None))
+    }
+
+    fn p2p(
+        id: usize,
+        start: Instant,
+        parent: *mut libc::c_void,
+        peer: i32,
+        is_send: bool,
+    ) -> slab::AllocatedNode<event::NcclOp> {
+        let mut descr = profiler_shim::tests::dummy_p2p_descr(peer, is_send);
+        descr.0.parentObj = parent;
+        slab::AllocatedNode::new(event::NcclOp::from_descr(&descr, start, id, Some(0xabc)))
+    }
+
+    #[test]
+    fn kernel_copy_counts_steps_of_already_reclaimed_ops() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let mut thread = ThreadState::default();
+        let mut exporter = NoopExport;
+        let parent = 44;
+        ctx.handle_fifo_message(
+            Message::NcclOp(coll(parent, Instant::now())),
+            &mut thread,
+            &mut exporter,
+        );
+        ctx.reclaim_all_ncclops_in_map();
+        ctx.pending_telemetry.clear();
+        let step = |size: u32, is_send: bool| event::KernelEventStep {
+            channel_id: 0,
+            is_send,
+            peer: 1,
+            step: 0,
+            size,
+            start_ts: 1_000,
+            ready_ts: 2_000,
+            end_ts: 12_000,
+        };
+        // The parent is gone, but a large send step still counts; small and
+        // recv steps do not.
+        for s in [step(196_608, true), step(1_024, true), step(196_608, false)] {
+            ctx.handle_fifo_message(Message::KernelStep(s, parent), &mut thread, &mut exporter);
+        }
+        ctx.flush_kernel_copy();
+        match ctx.pending_telemetry.pop_front() {
+            Some(Telemetry::KernelCopy(c)) => {
+                assert_eq!((c.bytes, c.copy_ns, c.steps), (196_608, 10_000, 1));
+                // The reclaimed parent's identity still names the op.
+                assert!(c.parent.is_some());
+            }
+            _ => panic!("expected one KernelCopy summary"),
+        }
+        ctx.flush_kernel_copy();
+        assert!(ctx.pending_telemetry.is_empty());
+    }
+
+    #[test]
+    fn completion_before_parent_is_preserved_and_late_progress_is_ignored() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let mut thread = ThreadState::default();
+        let mut exporter = NoopExport;
+        let parent = 42;
+        let child_start = Instant::now();
+        let duration = Duration::from_millis(3);
+
+        ctx.handle_fifo_message(
+            Message::KernelCh(child_start, duration.as_nanos() as u64, parent),
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(ctx.early_completions.contains_key(&parent));
+        assert!(!ctx.online_completed.contains(&parent));
+
+        ctx.handle_fifo_message(
+            Message::NcclOp(coll(parent, child_start - Duration::from_millis(1))),
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(!ctx.early_completions.contains_key(&parent));
+        assert!(ctx.online_completed.contains(&parent));
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::NcclOpIssued(_))
+        ));
+        let complete = ctx.pending_telemetry.pop_front();
+        match complete {
+            Some(Telemetry::NcclOpComplete(op)) => {
+                assert_eq!(op.basic_info().end_time(), Some(child_start + duration));
+            }
+            _ => panic!("expected online completion after launch record"),
+        }
+
+        ctx.handle_fifo_message(
+            Message::StepProgress {
+                source: event::StepProgressSource::Kernel,
+                stage: event::StepProgressStage::Posted,
+                observed_at: child_start + duration,
+                parent,
+                is_send: true,
+                peer: 1,
+                channel_id: 0,
+                step: 0,
+                size: 4096,
+            },
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(ctx.active_progress.is_empty());
+        assert!(ctx.pending_telemetry.is_empty());
+    }
+
+    #[test]
+    fn progress_before_parent_is_replayed_before_completion() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let mut thread = ThreadState::default();
+        let mut exporter = NoopExport;
+        let parent = 44;
+        let start = Instant::now();
+
+        ctx.handle_fifo_message(
+            Message::StepProgress {
+                source: event::StepProgressSource::KernelCh,
+                stage: event::StepProgressStage::Posted,
+                observed_at: start,
+                parent,
+                is_send: true,
+                peer: u32::MAX,
+                channel_id: 0,
+                step: -1,
+                size: 0,
+            },
+            &mut thread,
+            &mut exporter,
+        );
+        assert_eq!(ctx.early_progress.get(&parent).map(Vec::len), Some(1));
+
+        ctx.handle_fifo_message(
+            Message::NcclOp(coll(parent, start - Duration::from_millis(1))),
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(!ctx.early_progress.contains_key(&parent));
+        assert_eq!(ctx.active_progress.len(), 1);
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::NcclOpIssued(_))
+        ));
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::StepProgress(event::StepProgress {
+                source: event::StepProgressSource::KernelCh,
+                stage: event::StepProgressStage::Posted,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn completion_closes_inflight_progress_before_emitting_collective_end() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let mut thread = ThreadState::default();
+        let mut exporter = NoopExport;
+        let parent = 43;
+        let start = Instant::now();
+
+        ctx.handle_fifo_message(
+            Message::NcclOp(coll(parent, start)),
+            &mut thread,
+            &mut exporter,
+        );
+        ctx.pending_telemetry.clear();
+        ctx.handle_fifo_message(
+            Message::StepProgress {
+                source: event::StepProgressSource::Proxy,
+                stage: event::StepProgressStage::Posted,
+                observed_at: start,
+                parent,
+                is_send: true,
+                peer: 2,
+                channel_id: 1,
+                step: 7,
+                size: 8192,
+            },
+            &mut thread,
+            &mut exporter,
+        );
+        assert_eq!(ctx.active_progress.len(), 1);
+        ctx.pending_telemetry.clear();
+
+        ctx.handle_fifo_message(
+            Message::KernelCh(start, 1_000, parent),
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(ctx.active_progress.is_empty());
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::StepProgress(event::StepProgress {
+                stage: event::StepProgressStage::Complete,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::NcclOpComplete(_))
+        ));
+    }
+
+    #[test]
+    fn grouped_p2p_emits_parent_start_on_first_in_flight_child() {
+        use crate::event_ffi::AsFFI as _;
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let mut thread = ThreadState::default();
+        let mut exporter = NoopExport;
+        let group_event =
+            event::Event::new_group(&profiler_shim::tests::dummy_group_descr(), Instant::now());
+        let event::Event::Group(ref group) = group_event else {
+            panic!("expected Group");
+        };
+        let gid = group.id();
+        let handle = group_event.into_ffi();
+        let start = Instant::now();
+
+        ctx.handle_fifo_message(
+            Message::NcclOp(p2p(1, start, handle, 1, true)),
+            &mut thread,
+            &mut exporter,
+        );
+        match ctx.pending_telemetry.pop_front() {
+            Some(Telemetry::P2pParentStart(parent)) => {
+                assert_eq!(parent.group_id, gid);
+                assert_eq!(parent.n_children, 1);
+                assert_eq!(parent.name, "send");
+                let rec = parent.issued_trace_record(|_| 1);
+                assert_eq!(rec["cat"], "P2P_GROUP_START");
+                assert_eq!(rec["dur"], 0);
+            }
+            _ => panic!("expected in-flight P2P_GROUP_START"),
+        }
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::NcclOpIssued(_))
+        ));
+
+        ctx.handle_fifo_message(
+            Message::NcclOp(p2p(2, start, handle, 2, true)),
+            &mut thread,
+            &mut exporter,
+        );
+        assert!(matches!(
+            ctx.pending_telemetry.pop_front(),
+            Some(Telemetry::NcclOpIssued(_))
+        ));
+        assert!(ctx.pending_telemetry.is_empty());
+
+        let Some(event::Event::Group(mut group)) = (unsafe { event::Event::from_ffi(handle) })
+        else {
+            panic!("expected restored Group");
+        };
+        let stopped_at = start + Duration::from_micros(7);
+        group.basic_info_mut().update_end_time(stopped_at);
+        ctx.handle_fifo_message(Message::Group(group), &mut thread, &mut exporter);
+        match ctx.pending_telemetry.pop_front() {
+            Some(Telemetry::P2pGroupSeal(seal)) => {
+                assert_eq!(seal.group_id, gid);
+                assert_eq!(seal.n_children, 2);
+                assert_eq!(seal.observed_at, stopped_at);
+                assert_eq!(seal.trace_record(|_| 1)["cat"], "P2P_GROUP_SEAL");
+            }
+            _ => panic!("expected compact P2P_GROUP_SEAL"),
+        }
+    }
+
+    #[test]
+    fn standalone_p2p_gets_synthetic_parent_start_before_child_start() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let mut thread = ThreadState::default();
+        let mut exporter = NoopExport;
+
+        ctx.handle_fifo_message(
+            Message::NcclOp(p2p(1, Instant::now(), std::ptr::null_mut(), 2, false)),
+            &mut thread,
+            &mut exporter,
+        );
+
+        let gid = match ctx.pending_telemetry.pop_front() {
+            Some(Telemetry::P2pParentStart(parent)) => {
+                assert_eq!(parent.n_children, 1);
+                assert_eq!(parent.name, "recv");
+                let rec = parent.issued_trace_record(|_| 1);
+                assert_eq!(rec["cat"], "P2P_GROUP_START");
+                parent.group_id
+            }
+            _ => panic!("expected synthetic P2P_GROUP_START"),
+        };
+        match ctx.pending_telemetry.pop_front() {
+            Some(Telemetry::P2pGroupSeal(seal)) => {
+                assert_eq!(seal.group_id, gid);
+                assert_eq!(seal.n_children, 1);
+            }
+            _ => panic!("expected synthetic P2P_GROUP_SEAL"),
+        }
+        match ctx.pending_telemetry.pop_front() {
+            Some(Telemetry::NcclOpIssued(op)) => {
+                assert_eq!(op.parent_group_id(), Some(gid));
+                let rec = op.issued_trace_record(|_| 1);
+                assert_eq!(rec["cat"], "P2P_START");
+                assert_eq!(rec["parent"], gid);
+            }
+            _ => panic!("expected child P2P_START after its synthetic parent"),
+        }
+    }
 }

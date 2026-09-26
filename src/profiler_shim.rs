@@ -67,6 +67,17 @@ impl AsRef<ncclProfilerEventDescr_v4_t> for EventDescrV4 {
     }
 }
 
+#[repr(transparent)]
+#[derive(Debug, Clone)]
+pub struct EventDescrV6(pub ncclProfilerEventDescr_v6_t);
+
+impl AsRef<ncclProfilerEventDescr_v6_t> for EventDescrV6 {
+    #[inline(always)]
+    fn as_ref(&self) -> &ncclProfilerEventDescr_v6_t {
+        &self.0
+    }
+}
+
 pub type EventDescr = EventDescrV2;
 
 // alias of `ncclProfilerEventState_vX_t` to make the name shorter
@@ -112,6 +123,11 @@ pub mod proxy_event_state {
         pub const RECV_FLUSH_WAIT: u32 =
             ncclProfilerEventState_t_ncclProfilerProxyStepRecvFlushWait;
     }
+
+    pub mod v6 {
+        use super::*;
+        pub const KERNEL_STEP_STOP: u32 = ncclProfilerEventState_t_ncclProfilerKernelStepStop;
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +154,26 @@ pub(crate) mod tests {
             coll.func = c"AllGather".as_ptr();
             coll.count = 65536;
             coll.datatype = c"ncclInt8".as_ptr();
+        }
+        EventDescrV2(descr)
+    }
+
+    pub(crate) fn dummy_p2p_descr(peer: i32, is_send: bool) -> EventDescr {
+        let mut descr: ncclProfilerEventDescr_v2_t = unsafe { std::mem::zeroed() };
+        descr.type_ = ncclProfileP2p as _;
+        descr.parentObj = std::ptr::null_mut();
+        descr.rank = 0;
+        unsafe {
+            let p2p = &mut descr.__bindgen_anon_1.p2p;
+            p2p.commHash = 0xabc;
+            p2p.peer = peer;
+            p2p.func = if is_send {
+                c"Send".as_ptr()
+            } else {
+                c"Recv".as_ptr()
+            };
+            p2p.count = 1024;
+            p2p.datatype = c"ncclInt8".as_ptr();
         }
         EventDescrV2(descr)
     }
