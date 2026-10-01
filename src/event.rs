@@ -896,6 +896,11 @@ impl ProxyOp {
         self.aggregate_steps && self.step_histograms.is_empty()
     }
 
+    /// Cached steps (empty when steps are aggregated into histograms).
+    pub fn steps(&self) -> &[EventStep] {
+        self.steps.as_deref().unwrap_or(&[])
+    }
+
     pub fn add_step(&mut self, step: EventStep) {
         for histogram in self.step_histograms.iter() {
             histogram.record(&step);
@@ -987,6 +992,8 @@ pub struct ProxyStep {
     pub step: i32,
     pub size: usize,
     pub start_time: Option<Instant>,
+    /// Latest `SEND_PEER_WAIT`: NCCL records it before every post attempt.
+    pub last_attempt_time: Option<Instant>,
     pub fifo_ready_time: Option<Instant>,
     pub end_time: Option<Instant>,
     pub parent: *mut profiler::ProxyOpLocalData,
@@ -998,6 +1005,7 @@ impl ProxyStep {
             step,
             size: 0,
             start_time: None,
+            last_attempt_time: None,
             fifo_ready_time: None,
             end_time: None,
             parent,
@@ -1013,12 +1021,19 @@ impl ProxyStep {
             .fifo_ready_time
             .map(|t| (t - start_time).as_nanos() as u32);
         let net_start_time = self.fifo_ready_time.unwrap_or(start_time);
+        let hold_ns = match (self.last_attempt_time, self.fifo_ready_time) {
+            (Some(attempt), Some(posted)) if posted > attempt => {
+                (posted - attempt).as_nanos() as u32
+            }
+            _ => 0,
+        };
         EventStep {
             step: self.step,
             size: self.size,
             start_time: time_to_ns(&start_time),
             fifo_wait_dur_ns,
             dur_ns: (self.end_time.unwrap() - net_start_time).as_nanos() as _,
+            hold_ns,
         }
     }
 }
@@ -1028,6 +1043,27 @@ mod tests {
     use super::*;
 
     use std::time::Duration;
+
+    #[test]
+    fn proxy_step_hold_excludes_waiting_for_the_receiver() {
+        let t0 = Instant::now();
+        let at = |us: u64| t0 + Duration::from_micros(us);
+        let mut step = ProxyStep::new(3, std::ptr::null_mut());
+        step.size = 1 << 19;
+        // Data ready at 0; the receiver's buffer was missing until the
+        // attempt at 400us; the proxy then held the step until 900us.
+        step.start_time = Some(at(0));
+        step.last_attempt_time = Some(at(400));
+        step.fifo_ready_time = Some(at(900));
+        step.end_time = Some(at(950));
+        let s = step.finalize(|t| (*t - t0).as_nanos() as u64);
+        assert_eq!(s.fifo_wait_dur_ns, Some(900_000));
+        assert_eq!(s.hold_ns, 500_000);
+        assert_eq!(s.dur_ns, 50_000);
+        // Without fifo-wait tracking there is no posted time and no hold.
+        step.fifo_ready_time = None;
+        assert_eq!(step.finalize(|t| (*t - t0).as_nanos() as u64).hold_ns, 0);
+    }
 
     #[test]
     fn update_end_time_monotonic() {

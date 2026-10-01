@@ -608,6 +608,8 @@ pub struct ProxyOpLocalData {
     /// can become the representative.
     pub progress_active: bool,
     pub progress_step: i32,
+    /// ProxySteps started under `proxy_step_sample` (full ProxySteps off).
+    pub sampled_steps: u32,
 }
 
 impl ProxyOpLocalData {
@@ -633,6 +635,7 @@ impl ProxyOpLocalData {
             rng_seed: 0,
             progress_active: false,
             progress_step: -1,
+            sampled_steps: 0,
         }
     }
 
@@ -792,8 +795,10 @@ where
                 .unwrap_or(config.track_proxyop);
             if track_ncclop {
                 use nccl_metadata::NcclOpType;
+                // Sampled ProxySteps need a full (non-lite) parent too: a lite
+                // parent's ProxyOps skip step tracking altogether.
                 let track_steps = gates
-                    .map(|g| g.proxy_step_enabled())
+                    .map(|g| g.proxy_step_enabled() || g.proxy_step_sample() > 0)
                     .unwrap_or(config.track_steps || config.aggregate_steps);
                 let track_kernel_step = gates
                     .map(|g| g.track_kernel_step())
@@ -1050,7 +1055,10 @@ where
             let allow_steps = gates
                 .map(|g| g.proxy_step_enabled())
                 .unwrap_or_else(|| config.track_steps || config.aggregate_steps);
-            if !allow_steps {
+            // With full ProxySteps off, the first `sample` steps of each send
+            // ProxyOp still feed the monitor's proxy summary.
+            let sample = gates.map(|g| g.proxy_step_sample()).unwrap_or(0);
+            if !allow_steps && sample == 0 {
                 None
             } else {
                 // SAFETY: just checked that event type is proxystep
@@ -1063,21 +1071,29 @@ where
                     // NCCL always sets the parent_obj to a valid handle returned by profiler
                     // API. So `event::Event::from_ffi()` would always be called on a valid handle
                     let parent = unsafe { event::Event::from_ffi(parent_ffi) };
-                    if let Some(event::Event::ProxyOp(op)) = parent {
-                        with_thread_state(|thread_state| {
-                            let data = thread_state
-                                .proxystep_free_list
-                                .alloc_new(
-                                    event::ProxyStep::new(
-                                        descr.step(),
-                                        slab::AllocatedNode::into_raw(op),
-                                    ),
-                                    None,
-                                    true,
-                                )
-                                .unwrap();
-                            Some(event::Event::ProxyStep(data))
-                        })
+                    if let Some(event::Event::ProxyOp(mut op)) = parent {
+                        if !allow_steps && (!op.info.is_send || op.sampled_steps >= sample) {
+                            let _ = event::Event::ProxyOp(op).into_ffi();
+                            None
+                        } else {
+                            if !allow_steps {
+                                op.sampled_steps += 1;
+                            }
+                            with_thread_state(|thread_state| {
+                                let data = thread_state
+                                    .proxystep_free_list
+                                    .alloc_new(
+                                        event::ProxyStep::new(
+                                            descr.step(),
+                                            slab::AllocatedNode::into_raw(op),
+                                        ),
+                                        None,
+                                        true,
+                                    )
+                                    .unwrap();
+                                Some(event::Event::ProxyStep(data))
+                            })
+                        }
                     } else {
                         let _ = parent.map(event::Event::into_ffi);
                         None
@@ -1393,20 +1409,27 @@ where
 {
     if let event::Event::ProxyStep(data) = event {
         with_thread_state(|thread_state| match e_state {
+            // Runtime gate, so the monitor can enable fifo waits mid-run.
             profiler_shim::proxy_event_state::v4::SEND_PEER_WAIT => {
-                if data.start_time.is_none() && thread_state.profiler.config.track_step_fifo_wait {
-                    data.start_time = Some(thread_state.profiler.recent_timer_instant());
+                let now = thread_state.profiler.recent_timer_instant();
+                if data.start_time.is_none() && thread_state.profiler.gates.track_step_fifo_wait() {
+                    data.start_time = Some(now);
                 }
+                data.last_attempt_time = Some(now);
             }
             profiler_shim::proxy_event_state::v4::SEND_WAIT => {
                 let now = thread_state.profiler.recent_timer_instant();
-                if thread_state.profiler.config.track_step_fifo_wait {
+                // A step whose first attempt preceded the gate has no start.
+                if thread_state.profiler.gates.track_step_fifo_wait() && data.start_time.is_some() {
                     data.fifo_ready_time = Some(now);
                 } else {
                     data.start_time = Some(now);
                 }
                 data.size = e_state_args.trans_size();
-                if data.size as i64 >= ONLINE_PROGRESS_MIN_BYTES {
+                // Sampled steps (full ProxySteps off) only feed the summary.
+                if data.size as i64 >= ONLINE_PROGRESS_MIN_BYTES
+                    && thread_state.profiler.gates.proxy_step_enabled()
+                {
                     // SAFETY: state callbacks run on the ProxyStep owner's
                     // thread while the parent ProxyOp handle is live.
                     let parent = unsafe { &mut *data.parent };

@@ -29,7 +29,7 @@ use log::{info, warn};
 
 use serde::{Deserialize, Serialize};
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
 /// Desired metric enablement + retained pointer to NCCL's activation mask.
 #[derive(Debug)]
@@ -45,6 +45,9 @@ pub struct RuntimeGates {
     track_kernel_ch: AtomicBool,
     track_kernel_step: AtomicBool,
     track_recv_kernel_step: AtomicBool,
+    /// With full ProxySteps off, record at most this many steps of each send
+    /// ProxyOp (0: none). They only feed the ProxySend summary.
+    proxy_step_sample: AtomicU32,
     api_v6: AtomicBool,
     /// Points at NCCL `ncclProfilerEventMask` (same address every `init`).
     event_mask: AtomicPtr<i32>,
@@ -64,6 +67,7 @@ impl RuntimeGates {
             track_kernel_ch: AtomicBool::new(config.track_kernel_ch),
             track_kernel_step: AtomicBool::new(config.track_kernel_step),
             track_recv_kernel_step: AtomicBool::new(config.track_recv_kernel_step),
+            proxy_step_sample: AtomicU32::new(0),
             api_v6: AtomicBool::new(matches!(version, Version::V6)),
             event_mask: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -103,6 +107,10 @@ impl RuntimeGates {
         self.track_recv_kernel_step.load(Ordering::Acquire)
     }
 
+    pub fn proxy_step_sample(&self) -> u32 {
+        self.proxy_step_sample.load(Ordering::Acquire)
+    }
+
     pub fn proxy_step_enabled(&self) -> bool {
         self.track_steps() || self.aggregate_steps()
     }
@@ -120,6 +128,7 @@ impl RuntimeGates {
             track_kernel_ch: self.track_kernel_ch(),
             track_kernel_step: self.track_kernel_step(),
             track_recv_kernel_step: self.track_recv_kernel_step(),
+            proxy_step_sample: self.proxy_step_sample(),
             mask: self.compute_mask(),
         }
     }
@@ -164,7 +173,7 @@ impl RuntimeGates {
                 mask |= profiler_shim::ncclProfileKernelStepRecv as i32;
             }
         }
-        if self.proxy_step_enabled() {
+        if self.proxy_step_enabled() || self.proxy_step_sample() > 0 {
             mask |= profiler_shim::ncclProfileProxyStep as i32;
         }
         mask
@@ -198,6 +207,9 @@ impl RuntimeGates {
         changed |= swap_bool(&self.track_kernel_ch, update.track_kernel_ch);
         changed |= swap_bool(&self.track_kernel_step, update.track_kernel_step);
         changed |= swap_bool(&self.track_recv_kernel_step, update.track_recv_kernel_step);
+        if let Some(v) = update.proxy_step_sample {
+            changed |= self.proxy_step_sample.swap(v, Ordering::AcqRel) != v;
+        }
         if changed {
             let mask = self.publish_mask();
             info!(
@@ -241,6 +253,8 @@ pub struct GateUpdate {
     pub track_kernel_step: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track_recv_kernel_step: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_step_sample: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,12 +270,33 @@ pub struct GateSnapshot {
     pub track_kernel_ch: bool,
     pub track_kernel_step: bool,
     pub track_recv_kernel_step: bool,
+    #[serde(default)]
+    pub proxy_step_sample: u32,
     pub mask: i32,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_step_sample_keeps_proxy_steps_in_the_mask() {
+        let gates = RuntimeGates::new(&Config::default(), Version::V6);
+        gates.apply_update(&GateUpdate {
+            track_steps: Some(false),
+            aggregate_steps: Some(false),
+            ..Default::default()
+        });
+        let step_bit = profiler_shim::ncclProfileProxyStep as i32;
+        assert_eq!(gates.compute_mask() & step_bit, 0);
+        let update: GateUpdate = serde_json::from_str(r#"{"proxy_step_sample": 8}"#).unwrap();
+        assert!(gates.apply_update(&update));
+        assert_eq!(gates.proxy_step_sample(), 8);
+        assert!(!gates.proxy_step_enabled());
+        assert_ne!(gates.compute_mask() & step_bit, 0);
+        assert_eq!(gates.snapshot().proxy_step_sample, 8);
+        assert!(!gates.apply_update(&update), "unchanged");
+    }
 
     #[test]
     fn gate_update_json_roundtrip() {

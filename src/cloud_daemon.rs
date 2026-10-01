@@ -446,6 +446,7 @@ fn ring_publish(
         }
         Telemetry::CommInit(membership) => encode_comm_init(ring, membership, to_us),
         Telemetry::KernelCopy(c) => attempt(ring, &encode_kernel_copy(c, to_us)),
+        Telemetry::ProxySend(p) => attempt(ring, &encode_proxy_send(p, to_us)),
         // The following variants are intentionally *not* published on the
         // live ring:
         //  - CommOpen / CommClose: currently only affect the summary
@@ -534,6 +535,32 @@ fn encode_kernel_copy(c: &KernelCopySummary, to_us: impl Fn(Instant) -> i64) -> 
         pack_str(&mut slot.parent_name, &parent.parent_name);
     }
     pack_str(&mut slot.name, "KernelCopy");
+    slot
+}
+
+fn encode_proxy_send(p: &ProxySendSummary, to_us: impl Fn(Instant) -> i64) -> RingSlot {
+    let mut slot = RingSlot::zeroed();
+    slot.kind = SlotKind::ProxySend as u8;
+    slot.is_send = 1;
+    slot.ts = to_us(p.observed_at);
+    slot.rank = p.rank as i32;
+    slot.peer = p.peer;
+    slot.payload_bytes = p.bytes;
+    slot.step = p.post_ns;
+    slot.size = p.wire_ns;
+    slot.self_copy_size = p.max_post_ns;
+    slot.member_bus_id = p.hold_ns;
+    slot.duration_us = p.wire_ns / 1000;
+    slot.n_children = p.steps;
+    slot.n_peers = p.steady_steps;
+    if let Some(parent) = p.parent.as_ref() {
+        slot.launch_ts = to_us(parent.parent_start);
+        slot.comm_hash = parent.comm_hash;
+        slot.seq_num = parent.seq_num;
+        slot.group_id = parent.group_id.unwrap_or(0);
+        pack_str(&mut slot.parent_name, &parent.parent_name);
+    }
+    pack_str(&mut slot.name, "ProxySend");
     slot
 }
 
@@ -1099,7 +1126,7 @@ fn is_deadline_telemetry(telemetry: &Telemetry) -> bool {
 fn is_online_evidence(telemetry: &Telemetry) -> bool {
     matches!(
         telemetry,
-        Telemetry::StepProgress(_) | Telemetry::KernelCopy(_)
+        Telemetry::StepProgress(_) | Telemetry::KernelCopy(_) | Telemetry::ProxySend(_)
     )
 }
 
@@ -1281,6 +1308,7 @@ mod tests {
                     start_time: 123,
                     fifo_wait_dur_ns: None,
                     dur_ns: 256,
+                    hold_ns: 0,
                 });
                 thread_state
                     .send_to_daemon(Message::StepBatch(proxyop.clone(), step_batch, true), true);

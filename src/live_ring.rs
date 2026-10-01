@@ -84,6 +84,14 @@ pub enum SlotKind {
     /// `n_children` step count, `ts` op end. Lets the monitor measure the
     /// intra-host copy bandwidth without the rich nested trace.
     KernelCopy = 10,
+    /// Network proxy send summary of one completed op: `payload_bytes` summed
+    /// send-step bytes, `size` summed wire time (posted -> done, ns),
+    /// `n_children` step count, `step` summed post delay (data ready -> send
+    /// posted, ns) over the `n_peers` steps after each proxy op's first,
+    /// `self_copy_size` largest single-step post delay (ns), `member_bus_id`
+    /// summed proxy hold time (last post attempt -> posted, ns) over the same
+    /// steps, `peer` the destination rank, `ts` summary time.
+    ProxySend = 11,
 }
 
 impl SlotKind {
@@ -99,6 +107,7 @@ impl SlotKind {
             7 => Some(SlotKind::StepProgress),
             8 => Some(SlotKind::CommInitHeader),
             10 => Some(SlotKind::KernelCopy),
+            11 => Some(SlotKind::ProxySend),
             9 => Some(SlotKind::CommInitMember),
             _ => None,
         }

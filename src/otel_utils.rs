@@ -450,6 +450,7 @@ mod tests {
                     start_time: 1234567,
                     fifo_wait_dur_ns: None,
                     dur_ns: 512,
+                    hold_ns: 0,
                 };
                 h.record(&step);
             }

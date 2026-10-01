@@ -214,6 +214,9 @@ pub enum Telemetry {
     /// Same-host GPU copy summary of one parent op's KernelSteps processed in
     /// one polling pass, independent of whether that op is still tracked.
     KernelCopy(KernelCopySummary),
+    /// Network send summary of one parent op's proxy send steps processed in
+    /// one polling pass, independent of whether that op is still tracked.
+    ProxySend(ProxySendSummary),
 }
 
 /// Smallest KernelStep counted toward the copy-bandwidth summary.
@@ -272,6 +275,44 @@ pub struct KernelCopySummary {
     pub parent: Option<CopyParent>,
 }
 
+/// Proxy send steps of one parent op: `bytes` over `steps` steps and
+/// `wire_ns` summed from posted to done on the network. `post_ns` sums the
+/// time from data ready to the send being posted (`SEND_REM_FIFO_WAIT` ->
+/// `SEND_TRANSMITTED`: waiting for the receiver's buffer plus proxy thread
+/// latency) over the `steady_steps` steps after each proxy op's first; the
+/// first step also waits for a late peer to arrive. `max_post_ns` is the
+/// largest single step, first steps included. `hold_ns` sums, over the same
+/// steady steps, the time from the proxy's last post attempt to the posted
+/// send: NCCL records `SEND_PEER_WAIT` before every attempt, so this excludes
+/// waiting for the receiver and grows only when the sending proxy is slow.
+#[derive(Debug, Clone)]
+pub struct ProxySendSummary {
+    pub rank: usize,
+    pub peer: i32,
+    pub bytes: i64,
+    pub post_ns: i64,
+    pub max_post_ns: i64,
+    pub hold_ns: i64,
+    pub wire_ns: i64,
+    pub steps: u32,
+    pub steady_steps: u32,
+    pub observed_at: Instant,
+    pub parent: Option<CopyParent>,
+}
+
+#[derive(Default)]
+struct ProxySendAcc {
+    rank: usize,
+    peer: i32,
+    bytes: i64,
+    post_ns: i64,
+    max_post_ns: i64,
+    hold_ns: i64,
+    wire_ns: i64,
+    steps: u32,
+    steady_steps: u32,
+}
+
 /// Accumulator for P2Ps that share one NCCL Group. Native COLLs in the same
 /// group are emitted on their own; P2Ps wait here and nest under P2P_GROUP.
 #[derive(Default)]
@@ -299,6 +340,7 @@ pub struct PollingContext<'a> {
     /// arrive, so the summary must not depend on attaching steps to a live op.
     copy_acc: HashMap<usize, (i64, i64, u32)>,
     copy_rank: Option<usize>,
+    proxy_acc: HashMap<usize, ProxySendAcc>,
     /// Identity of recently registered parent ops, with a generation so a
     /// reused op id evicts only its own older entry.
     copy_parents: HashMap<usize, (CopyParent, u64)>,
@@ -337,6 +379,7 @@ impl<'a> PollingContext<'a> {
             stop: stop_signal,
             copy_acc: HashMap::new(),
             copy_rank: None,
+            proxy_acc: HashMap::new(),
             copy_parents: HashMap::new(),
             copy_parent_order: VecDeque::new(),
             copy_parent_gen: 0,
@@ -356,6 +399,7 @@ impl<'a> PollingContext<'a> {
     /// Publish the KernelStep copy time accumulated in this polling pass,
     /// one summary per parent op.
     pub fn flush_kernel_copy(&mut self) {
+        self.flush_proxy_send();
         if self.copy_acc.is_empty() {
             return;
         }
@@ -873,7 +917,8 @@ impl<'a> PollingContext<'a> {
         // Prefer runtime gates (comma-monitor mid-flight enable) over the
         // process-start Config snapshot.
         let gates = &self.profiler.gates;
-        let track_steps = gates.track_steps();
+        // Sampled steps (`proxy_step_sample`) are kept for the proxy summary.
+        let track_steps = gates.track_steps() || gates.proxy_step_sample() > 0;
         let aggregate_cfg = gates.aggregate_steps();
         let track_interprocess = gates.track_interprocess_proxyop();
         if info.parent().is_some() {
@@ -919,6 +964,72 @@ impl<'a> PollingContext<'a> {
     }
 
     #[allow(clippy::vec_box)]
+    /// Publish the proxy send steps accumulated in this polling pass, one
+    /// summary per parent op. Proxy ops often end after their parent op was
+    /// exported (the network send completes after the GPU kernel), so this
+    /// summary does not depend on the parent still being tracked.
+    fn flush_proxy_send(&mut self) {
+        if self.proxy_acc.is_empty() {
+            return;
+        }
+        let observed_at = Instant::now();
+        let mut acc: Vec<_> = self.proxy_acc.drain().collect();
+        acc.sort_by_key(|(parent, _)| *parent);
+        for (parent, a) in acc {
+            if a.steps == 0 {
+                continue;
+            }
+            let identity = self.copy_parents.get(&parent).map(|(p, _)| p.clone());
+            self.pending_telemetry
+                .push_back(Telemetry::ProxySend(ProxySendSummary {
+                    rank: identity.as_ref().map(|p| p.rank).unwrap_or(a.rank),
+                    peer: a.peer,
+                    bytes: a.bytes,
+                    post_ns: a.post_ns,
+                    max_post_ns: a.max_post_ns,
+                    hold_ns: a.hold_ns,
+                    wire_ns: a.wire_ns,
+                    steps: a.steps,
+                    steady_steps: a.steady_steps,
+                    observed_at,
+                    parent: identity,
+                }));
+        }
+    }
+
+    fn accumulate_proxy_send(
+        &mut self,
+        info: &event::ProxyOpInfo,
+        proxyops: &[Box<event::ProxyOp>],
+    ) {
+        if !info.is_send || info.pid != self.profiler.pid {
+            return;
+        }
+        let Some(parent) = info.parent() else {
+            return;
+        };
+        for p in proxyops {
+            for s in p.steps() {
+                if s.size == 0 {
+                    continue;
+                }
+                let acc = self.proxy_acc.entry(parent).or_default();
+                let post = s.fifo_wait_dur_ns.unwrap_or(0) as i64;
+                acc.rank = info.rank;
+                acc.peer = info.peer as i32;
+                acc.bytes += s.size as i64;
+                acc.max_post_ns = acc.max_post_ns.max(post);
+                acc.wire_ns += s.dur_ns as i64;
+                acc.steps += 1;
+                if s.step > 0 {
+                    acc.post_ns += post;
+                    acc.hold_ns += s.hold_ns as i64;
+                    acc.steady_steps += 1;
+                }
+            }
+        }
+    }
+
     fn handle_proxyop_end(
         &mut self,
         end_time: Instant,
@@ -926,6 +1037,7 @@ impl<'a> PollingContext<'a> {
         proxyops: Vec<Box<event::ProxyOp>>,
         send_ipc: bool,
     ) {
+        self.accumulate_proxy_send(info, &proxyops);
         // Runtime gates: when the monitor escalates after an anomaly, newly
         // completed ProxyOps must be attached to the parent COLL JSON even
         // though process-start Config still has track_proxyop/steps=false.
