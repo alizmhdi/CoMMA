@@ -372,6 +372,17 @@ pub struct PollingContext<'a> {
     /// transition and replay it as soon as the parent is registered.
     early_progress: HashMap<usize, Vec<PendingProgress>>,
     online_completed: HashSet<usize>,
+    /// Completion order of `online_completed`, so entries expire after
+    /// `online_state_horizon` instead of accumulating one per collective for
+    /// the whole job; late callbacks arrive within milliseconds.
+    online_completed_order: VecDeque<(usize, Instant)>,
+    last_online_prune: Instant,
+}
+
+/// The three online maps below keep an entry only until a racing callback
+/// meets its parent; anything older than this is a leftover.
+fn online_state_horizon(completion_delay: Duration) -> Duration {
+    std::cmp::max(Duration::from_secs(10), completion_delay * 4)
 }
 
 impl<'a> PollingContext<'a> {
@@ -397,6 +408,8 @@ impl<'a> PollingContext<'a> {
             early_completions: HashMap::new(),
             early_progress: HashMap::new(),
             online_completed: HashSet::new(),
+            online_completed_order: VecDeque::new(),
+            last_online_prune: Instant::now(),
         }
     }
 
@@ -547,6 +560,27 @@ impl<'a> PollingContext<'a> {
         }
     }
 
+    /// Expire `online_completed` and the early (callback-before-parent) maps
+    /// past `online_state_horizon`; at most once a second.
+    fn prune_online_state(&mut self) {
+        if self.last_online_prune.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_online_prune = Instant::now();
+        let horizon = online_state_horizon(self.profiler.config.ncclop_completion_delay);
+        while let Some(&(parent, at)) = self.online_completed_order.front() {
+            if at.elapsed() < horizon {
+                break;
+            }
+            self.online_completed_order.pop_front();
+            self.online_completed.remove(&parent);
+        }
+        self.early_completions
+            .retain(|_, (_, end)| end.elapsed() < horizon);
+        self.early_progress
+            .retain(|_, pending| pending.first().is_some_and(|p| p.2.elapsed() < horizon));
+    }
+
     fn complete_ncclop(&mut self, parent: usize, child_start: Instant, end_time: Instant) {
         if self.online_completed.contains(&parent) {
             return;
@@ -566,6 +600,8 @@ impl<'a> PollingContext<'a> {
         let completed = ncclop.clone();
 
         self.online_completed.insert(parent);
+        self.online_completed_order
+            .push_back((parent, Instant::now()));
         self.finish_parent_progress(parent, end_time);
         self.pending_telemetry
             .push_back(Telemetry::NcclOpComplete(Box::new(completed)));
@@ -1096,6 +1132,16 @@ impl<'a> PollingContext<'a> {
                 acc.self_copy_size = acc.self_copy_size.max(group.self_copy_size());
                 self.emit_p2p_group_seal(gid);
                 self.try_emit_p2p_parent(gid, false);
+                // A collective's Group has no P2P children, so nothing will
+                // ever be emitted for it: drop the entry instead of keeping
+                // one per collective for the whole job.
+                if self
+                    .p2p_groups
+                    .get(&gid)
+                    .is_some_and(|g| g.expected == 0 && g.children.is_empty())
+                {
+                    self.p2p_groups.remove(&gid);
+                }
                 if self.profiler.config.track_group {
                     self.pending_telemetry
                         .push_back(Telemetry::Group(Box::new(group)));
@@ -1431,6 +1477,12 @@ const FIFO_RECV_BATCH: usize = profiler::EVENT_QUEUE_SZ;
 const IPC_RECV_BATCH: usize = 512;
 const IPC_SEND_BATCH: usize = 64;
 const NCCLOP_RECLAIM_BATCH: usize = 512;
+/// After `IDLE_SPIN` without a message the daemon sleeps `IDLE_SLEEP` per
+/// polling pass instead of spinning. A daemon that never sleeps holds a whole
+/// core next to the training threads (one per process). Records wait at most
+/// about one sleep; the monitor polls every 20 ms.
+const IDLE_SPIN: Duration = Duration::from_micros(20);
+const IDLE_SLEEP: Duration = Duration::from_micros(50);
 
 pub fn polling_loop<E>(ctx: &mut PollingContext, mut exporter: E)
 where
@@ -1452,6 +1504,7 @@ where
 
     let ncclop_timeout = ctx.profiler.config.ncclop_timeout;
     let ncclop_comp_delay = ctx.profiler.config.ncclop_completion_delay;
+    let mut last_activity = Instant::now();
 
     while !ctx.stop.load(Ordering::Acquire) {
         while let Some(ctrl_msg) = ctx.profiler.ctrl_fifo.pop() {
@@ -1485,10 +1538,12 @@ where
 
         n_recv += ipc_msg.len();
 
+        let mut n_online = 0;
         for thread in threads.iter_mut() {
-            thread
-                .ncclop_fifo
-                .recv_many(FIFO_FETCH_INTERVAL, FIFO_RECV_BATCH, n_recv > 0);
+            n_online +=
+                thread
+                    .ncclop_fifo
+                    .recv_many(FIFO_FETCH_INTERVAL, FIFO_RECV_BATCH, n_recv > 0);
             thread
                 .ncclop_fifo
                 .process_many(ONLINE_FIFO_PROCESS_BATCH, |msg| {
@@ -1576,7 +1631,28 @@ where
         }
 
         ctx.flush_kernel_copy();
-        exporter.export(ctx, None)
+        ctx.prune_online_state();
+        exporter.export(ctx, None);
+
+        if n_recv + n_online > 0 || !ctx.pending_telemetry.is_empty() {
+            last_activity = Instant::now();
+        } else if last_activity.elapsed() >= IDLE_SPIN {
+            std::thread::sleep(IDLE_SLEEP);
+        }
+    }
+
+    // A thread can register just before the stop (between two passes): pick
+    // it up so the final drain sees its records too.
+    while let Some(ctrl_msg) = ctx.profiler.ctrl_fifo.pop() {
+        match ctrl_msg {
+            ControlMessage::NewThread(mut ctrl) => {
+                ctrl.daemon_state.idx = threads.len();
+                threads.push(ctrl);
+            }
+            ControlMessage::SetGates(update) => {
+                let _ = ctx.profiler.gates.apply_update(&update);
+            }
+        }
     }
 
     for thread in threads.iter_mut() {
@@ -1944,5 +2020,45 @@ mod tests {
             }
             _ => panic!("expected child P2P_START after its synthetic parent"),
         }
+    }
+
+    #[test]
+    fn collective_group_leaves_no_p2p_group_entry() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let mut thread = ThreadState::default();
+        let mut exporter = NoopExport;
+        for _ in 0..3 {
+            let event::Event::Group(group) =
+                event::Event::new_group(&profiler_shim::tests::dummy_group_descr(), Instant::now())
+            else {
+                panic!("expected Group");
+            };
+            ctx.handle_fifo_message(Message::Group(*group), &mut thread, &mut exporter);
+        }
+        assert!(ctx.p2p_groups.is_empty());
+    }
+
+    #[test]
+    fn online_state_expires_after_the_horizon() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = PollingContext::new(&profiler, Arc::new(AtomicBool::new(false)));
+        let horizon = online_state_horizon(profiler.config.ncclop_completion_delay);
+        let Some(old) = Instant::now().checked_sub(horizon + Duration::from_secs(2)) else {
+            return;
+        };
+        let recent = Instant::now();
+        ctx.online_completed.insert(1);
+        ctx.online_completed_order.push_back((1, old));
+        ctx.online_completed.insert(2);
+        ctx.online_completed_order.push_back((2, recent));
+        ctx.early_completions.insert(3, (old, old));
+        ctx.early_completions.insert(4, (recent, recent));
+        ctx.last_online_prune = old;
+        ctx.prune_online_state();
+        assert!(!ctx.online_completed.contains(&1));
+        assert!(ctx.online_completed.contains(&2));
+        assert!(!ctx.early_completions.contains_key(&3));
+        assert!(ctx.early_completions.contains_key(&4));
     }
 }
