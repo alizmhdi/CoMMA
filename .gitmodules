@@ -1,3 +1,4 @@
 [submodule "third_party/nccl"]
 	path = third_party/nccl
-	url = https://github.com/NVIDIA/nccl.git
+	url = https://github.com/alizmhdi/nccl.git
+	branch = kernelstep-profiler

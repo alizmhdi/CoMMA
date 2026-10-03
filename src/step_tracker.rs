@@ -24,6 +24,9 @@ pub struct EventStep {
     pub start_time: u64, // start time from profiler init, in nanoseconds
     pub fifo_wait_dur_ns: Option<u32>, // time spent waiting for CTS signal from receiver
     pub dur_ns: u32, // for sender, this is time spent on sending data after receiving CTS from receiver
+    // for sender, time from the proxy's last post attempt (after CTS) until the
+    // send was posted: proxy-side latency without waiting for the receiver
+    pub hold_ns: u32,
 }
 
 impl EventStep {
@@ -66,6 +69,7 @@ impl EventStepInProgress {
             start_time: self.start_time,
             fifo_wait_dur_ns,
             dur_ns: (self.end_time.unwrap() - net_start_time) as _,
+            hold_ns: 0,
         }
     }
 }

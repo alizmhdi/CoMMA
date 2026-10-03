@@ -55,6 +55,7 @@ CoMMA can export raw telemetry data to local files in JSON format.
 | Environment Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `NCCL_PROFILER_LATENCY_FILE` | String | *None* | Path to the local file where raw event telemetry will be written (e.g., `/tmp/latency-%p.json`). Supports `%p` for PID. |
+| `NCCL_PROFILER_LATENCY_RING_DIR` | String | *None* | Directory in which the profiler creates one file-backed SPSC ring per process (`<dir>/ring-<pid>.ring`) containing packed POD lifecycle/progress records (no JSON encode/decode on the live path). Consumed by `comma-monitor --ring-dir`. The producer is non-blocking: on a full ring the slot is dropped and the ring's `dropped` counter is incremented. |
 | `NCCL_PROFILER_SUMMARY_FILE` | String | *None* | Path to the local file where periodic summaries will be written. |
 | `NCCL_PROFILER_SUMMARY_INTERVAL` | Duration | `60s` | Interval at which periodic summaries are calculated and written to `SUMMARY_FILE`. |
 
