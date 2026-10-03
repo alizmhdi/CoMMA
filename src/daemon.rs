@@ -125,7 +125,11 @@ pub enum ControlMessage {
 
 #[derive(Debug)]
 pub enum Message {
-    Group(Box<event::Group>),
+    /// By value: the profiler thread that boxed the Group at start frees the
+    /// box at stop. A Box freed here would go back to that thread's glibc
+    /// arena under its lock, which the training thread's own mallocs then
+    /// wait on (about 15 us per NCCL call on DP2xTP2).
+    Group(event::Group),
     NcclOp(slab::AllocatedNode<event::NcclOp>),
     ProxyOpLite(
         /* start time */ Instant,
@@ -1093,7 +1097,8 @@ impl<'a> PollingContext<'a> {
                 self.emit_p2p_group_seal(gid);
                 self.try_emit_p2p_parent(gid, false);
                 if self.profiler.config.track_group {
-                    self.pending_telemetry.push_back(Telemetry::Group(group));
+                    self.pending_telemetry
+                        .push_back(Telemetry::Group(Box::new(group)));
                 }
             }
             Message::NcclOp(op) => {
@@ -1888,7 +1893,7 @@ mod tests {
         };
         let stopped_at = start + Duration::from_micros(7);
         group.basic_info_mut().update_end_time(stopped_at);
-        ctx.handle_fifo_message(Message::Group(group), &mut thread, &mut exporter);
+        ctx.handle_fifo_message(Message::Group(*group), &mut thread, &mut exporter);
         match ctx.pending_telemetry.pop_front() {
             Some(Telemetry::P2pGroupSeal(seal)) => {
                 assert_eq!(seal.group_id, gid);

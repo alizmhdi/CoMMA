@@ -1290,7 +1290,7 @@ mod tests {
                 })
                 .collect();
 
-            thread_state.send_to_daemon(Message::Group(group), true);
+            thread_state.send_to_daemon(Message::Group(*group), true);
             thread_state.send_to_daemon(Message::NcclOp(coll), true);
 
             let mut step_batch_list = slab::FreeList::new_list(proxyops.len());

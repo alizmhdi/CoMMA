@@ -1222,7 +1222,7 @@ pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
             // RDMA/proxy detail cannot delay P2P_GROUP_SEAL past an online CO
             // deadline.
             group.basic_info_mut().update_end_time(Instant::now());
-            thread_state.send_ncclop_to_daemon(daemon::Message::Group(group), true);
+            thread_state.send_ncclop_to_daemon(daemon::Message::Group(*group), true);
         }
         event::Event::ProxyOpLite(data) => {
             thread_state.fifo.prefetch_next();
