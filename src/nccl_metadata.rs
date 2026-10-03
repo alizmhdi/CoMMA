@@ -1519,6 +1519,12 @@ impl ProxyStepStateV6 {
     pub fn kernel_step_ptimer(&self) -> u64 {
         unsafe { self.0.kernelStep.pTimer }
     }
+
+    /// KernelCh stop state: GPU `globaltimer` at the channel's end.
+    #[inline(always)]
+    pub fn kernel_ch_ptimer(&self) -> u64 {
+        unsafe { self.0.kernelCh.pTimer }
+    }
 }
 
 impl ProxyStepState for ProxyStepStateV6 {

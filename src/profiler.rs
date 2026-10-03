@@ -210,6 +210,7 @@ pub fn thread_local_state(profiler: &'_ Profiler) -> (ThreadLocalState<'_>, daem
         kernel_progress_active: HashSet::new(),
         proxyop_id: 0,
         rng: SmallRng::from_rng(&mut rand::rng()),
+        gpu_clock: GpuClock::default(),
     };
     let thread_control = daemon::ThreadControl::new(
         daemon::FifoReceiver::new(ncclop_rx),
@@ -261,6 +262,48 @@ pub struct ThreadLocalState<'a> {
 
     proxyop_id: u32,
     rng: SmallRng,
+    /// Maps this thread's GPU `globaltimer` (KernelCh `pTimer`) to host time.
+    pub gpu_clock: GpuClock,
+}
+
+/// GPU `globaltimer` -> host `Instant` for KernelCh events. Every observation
+/// on the host comes after the GPU event, so the smallest (host - GPU) seen is
+/// the best offset estimate; it is taken over the current and the previous
+/// `GpuClock::WINDOW` so the two clocks may drift slowly. With the offset,
+/// KernelCh start/end are the kernel's own timestamps however late the proxy
+/// thread polls them.
+#[derive(Debug, Default)]
+pub struct GpuClock {
+    window_start_ns: u64,
+    window_min: Option<i128>,
+    prev_min: Option<i128>,
+}
+
+impl GpuClock {
+    const WINDOW_NS: u64 = 2_000_000_000;
+
+    /// `observed_ns`: host time of the observation (ns since `init_instant`).
+    /// Returns the event's host time in the same units, never after the
+    /// observation; `None` without a GPU timestamp.
+    pub fn host_ns(&mut self, gpu_ns: u64, observed_ns: u64) -> Option<u64> {
+        if gpu_ns == 0 {
+            return None;
+        }
+        let sample = observed_ns as i128 - gpu_ns as i128;
+        if observed_ns.saturating_sub(self.window_start_ns) >= Self::WINDOW_NS {
+            self.prev_min = self.window_min;
+            self.window_min = None;
+            self.window_start_ns = observed_ns;
+        }
+        self.window_min = Some(self.window_min.map_or(sample, |m| m.min(sample)));
+        let offset = match (self.window_min, self.prev_min) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            _ => sample,
+        };
+        let t = gpu_ns as i128 + offset;
+        (t >= 0 && t <= observed_ns as i128).then_some(t as u64)
+    }
 }
 
 impl ThreadLocalState<'_> {
@@ -311,9 +354,23 @@ impl ThreadLocalState<'_> {
         }
     }
 
-    pub fn inc_kernelch_ref(&mut self, pid: libc::pid_t, op: usize) {
-        let now = self.profiler.recent_timer_instant();
-        self.kernelch_refcnt.entry((pid, op)).or_insert((0, now)).0 += 1;
+    /// `start`: this KernelCh's start; the op keeps the earliest.
+    pub fn inc_kernelch_ref(&mut self, pid: libc::pid_t, op: usize, start: Instant) {
+        let e = self.kernelch_refcnt.entry((pid, op)).or_insert((0, start));
+        e.0 += 1;
+        e.1 = e.1.min(start);
+    }
+
+    /// Host instant of a GPU `globaltimer` value (KernelCh `pTimer`); the
+    /// observation time when the event carries none.
+    pub fn gpu_instant(&mut self, gpu_ns: u64) -> Instant {
+        let now = Instant::now();
+        let init = self.profiler.init_instant;
+        let observed_ns = now.saturating_duration_since(init).as_nanos() as u64;
+        match self.gpu_clock.host_ns(gpu_ns, observed_ns) {
+            Some(ns) => init + std::time::Duration::from_nanos(ns),
+            None => now,
+        }
     }
 
     /// Returns the first KernelCh start once the op's last KernelCh stops.
@@ -576,6 +633,8 @@ pub fn dump_comm_membership(
 #[repr(align(16))]
 pub struct KernelCh {
     pub parent_op: Option<usize>,
+    /// GPU `pTimer` of the KernelCh stop state (0 until recorded).
+    pub end_ptimer: u64,
 }
 
 #[derive(Debug)]
@@ -1007,13 +1066,22 @@ where
                     let parent = event_ffi::ProxyParent::from_ffi(parent_ffi);
                     if let event_ffi::ProxyParent::NcclOp(ncclop) = parent {
                         let channel_id = kernel_ch_channel_id(descr);
+                        let ptimer = kernel_ch_ptimer(descr);
                         with_thread_state(|thread_state| {
-                            thread_state.inc_kernelch_ref(thread_state.profiler.pid, ncclop);
+                            // The kernel's own start time: the proxy thread
+                            // may poll the stamp well after it was written.
+                            let started_at = thread_state.gpu_instant(ptimer);
+                            thread_state.inc_kernelch_ref(
+                                thread_state.profiler.pid,
+                                ncclop,
+                                started_at,
+                            );
                             let kernelch = thread_state
                                 .kernelch_free_list
                                 .alloc_new(
                                     KernelCh {
                                         parent_op: Some(ncclop),
+                                        end_ptimer: 0,
                                     },
                                     None,
                                     true,
@@ -1031,7 +1099,7 @@ where
                                 daemon::Message::StepProgress {
                                     source: event::StepProgressSource::KernelCh,
                                     stage: event::StepProgressStage::Posted,
-                                    observed_at: thread_state.profiler.recent_timer_instant(),
+                                    observed_at: started_at,
                                     parent: ncclop,
                                     is_send: true,
                                     peer: u32::MAX,
@@ -1190,6 +1258,32 @@ where
     Ok(event)
 }
 
+/// GPU `globaltimer` start of a KernelCh (`kernelCh.pTimer`; 0 if absent).
+fn kernel_ch_ptimer<E>(descr: &E) -> u64
+where
+    E: nccl_metadata::Version + nccl_metadata::Event,
+{
+    match E::version() {
+        Version::V4 => {
+            // SAFETY: as in `kernel_ch_channel_id`.
+            let d = unsafe { &*(descr as *const E as *const profiler_shim::EventDescrV4) };
+            unsafe { d.0.__bindgen_anon_1.kernelCh.pTimer }
+        }
+        Version::V6 => {
+            let d = unsafe { &*(descr as *const E as *const profiler_shim::EventDescrV6) };
+            unsafe { d.0.__bindgen_anon_1.kernelCh.pTimer }
+        }
+        _ => 0,
+    }
+}
+
+/// Record the KernelCh stop state's GPU time on the live event.
+pub fn record_kernelch_stop(event: &mut event::Event, ptimer: u64) {
+    if let event::Event::KernelCh(kernelch) = event {
+        kernelch.end_ptimer = ptimer;
+    }
+}
+
 fn kernel_ch_channel_id<E>(descr: &E) -> u8
 where
     E: nccl_metadata::Version + nccl_metadata::Event,
@@ -1305,12 +1399,14 @@ pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
         event::Event::KernelCh(kernelch) => {
             thread_state.fifo.prefetch_next();
             if let Some(ncclop) = kernelch.parent_op {
+                // The kernel's own end time (KernelCh stop state), as for the start.
+                let ended_at = thread_state.gpu_instant(kernelch.end_ptimer);
                 if let Some(start_time) =
                     thread_state.dec_kernelch_ref(thread_state.profiler.pid, ncclop)
                 {
                     let msg = daemon::Message::KernelCh(
                         start_time,
-                        start_time.elapsed().as_nanos() as u64,
+                        ended_at.saturating_duration_since(start_time).as_nanos() as u64,
                         ncclop,
                     );
                     thread_state.send_ncclop_to_daemon(msg, true);
@@ -1557,6 +1653,40 @@ pub fn finalize_handler(comm: Box<Communicator>) -> NcclResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_clock_takes_the_smallest_delay_and_never_runs_ahead() {
+        let mut c = GpuClock::default();
+        // Host = GPU + 1_000_000 ns, observed 5, 40 and 2 us late.
+        assert_eq!(
+            c.host_ns(10_000, 1_010_000 + 5_000),
+            Some(1_010_000 + 5_000)
+        );
+        assert_eq!(
+            c.host_ns(20_000, 1_020_000 + 40_000),
+            Some(1_020_000 + 5_000)
+        );
+        assert_eq!(
+            c.host_ns(30_000, 1_030_000 + 2_000),
+            Some(1_030_000 + 2_000)
+        );
+        assert_eq!(
+            c.host_ns(40_000, 1_040_000 + 30_000),
+            Some(1_040_000 + 2_000)
+        );
+        // No GPU timestamp: no mapping.
+        assert_eq!(c.host_ns(0, 2_000_000), None);
+        // A later window forgets old samples, but keeps the previous window's.
+        let w = GpuClock::WINDOW_NS;
+        assert_eq!(
+            c.host_ns(w + 40_000, w + 1_040_000 + 9_000),
+            Some(w + 1_040_000 + 2_000)
+        );
+        assert_eq!(
+            c.host_ns(3 * w, 3 * w + 1_000_000 + 7_000),
+            Some(3 * w + 1_000_000 + 7_000)
+        );
+    }
 
     #[test]
     fn comm_membership_json_has_full_table() {

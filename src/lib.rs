@@ -487,6 +487,18 @@ unsafe extern "C" fn profiler_record_event_state_v6(
             }
         }
 
+        event_ffi::Type::KernelCh => {
+            if e_state == profiler_shim::ncclProfilerEventState_t_ncclProfilerKernelChStop
+                && !e_state_args.is_null()
+            {
+                if let Some(mut event) = event::Event::from_ffi(e_handle) {
+                    let state = nccl_metadata::ProxyStepStateV6::cast_from_union(&*e_state_args);
+                    profiler::record_kernelch_stop(&mut event, state.kernel_ch_ptimer());
+                    let _ = event::Event::into_ffi(event);
+                }
+            }
+        }
+
         event_ffi::Type::KernelStep => {
             if let Some(mut event) = event::Event::from_ffi(e_handle) {
                 let step_state = nccl_metadata::ProxyStepStateV6::cast_from_union(&*e_state_args);
