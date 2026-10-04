@@ -1112,16 +1112,23 @@ impl Export for Exporter {
     }
 }
 
-/// KernelCh progress rides the deadline lane with its parent's issue and
+/// A collective's KernelCh progress rides the deadline lane with its issue and
 /// completion: the posted record carries the collective's GPU start, which the
 /// monitor must see before the completion. On the online lane the biased
 /// writer let completions overtake it (35-75% of DP2 x TP2 collectives, more
 /// with a lazier proxy poll), and the monitor then took the CPU enqueue as the
 /// GPU start, hiding queueing behind a busy GPU.
+///
+/// P2P KernelCh progress stays on the online lane. A grouped send/recv's first
+/// KernelCh can be stamped only once a stalled peer arrives; on a healthy EP4
+/// rank waiting for a peer's host stall that read as ~50 ms of local GPU
+/// backlog and a false compute root, which the monitor's MoE rules do not
+/// separate yet.
 fn is_deadline_telemetry(telemetry: &Telemetry) -> bool {
     match telemetry {
         Telemetry::StepProgress(progress) => {
             progress.source == event::StepProgressSource::KernelCh
+                && !matches!(progress.parent_name.as_str(), "send" | "recv")
         }
         _ => matches!(
             telemetry,
@@ -1159,7 +1166,7 @@ mod deadline_lane_tests {
         assert!(!is_online_evidence(&seal));
     }
 
-    fn progress(source: event::StepProgressSource) -> Telemetry {
+    fn progress(source: event::StepProgressSource, parent_name: &str) -> Telemetry {
         let now = Instant::now();
         Telemetry::StepProgress(event::StepProgress {
             source,
@@ -1170,7 +1177,7 @@ mod deadline_lane_tests {
             rank: 0,
             comm_hash: 1,
             seq_num: 2,
-            parent_name: "all_gather".into(),
+            parent_name: parent_name.into(),
             is_send: true,
             peer: u32::MAX,
             channel_id: 0,
@@ -1180,11 +1187,14 @@ mod deadline_lane_tests {
     }
 
     #[test]
-    fn kernel_ch_progress_keeps_parent_order() {
-        let kernel_ch = progress(event::StepProgressSource::KernelCh);
+    fn collective_kernel_ch_progress_keeps_parent_order() {
+        let kernel_ch = progress(event::StepProgressSource::KernelCh, "all_gather");
         assert!(is_deadline_telemetry(&kernel_ch));
         assert!(!is_online_evidence(&kernel_ch));
-        let kernel_step = progress(event::StepProgressSource::Kernel);
+        let p2p_kernel_ch = progress(event::StepProgressSource::KernelCh, "send");
+        assert!(!is_deadline_telemetry(&p2p_kernel_ch));
+        assert!(is_online_evidence(&p2p_kernel_ch));
+        let kernel_step = progress(event::StepProgressSource::Kernel, "all_gather");
         assert!(!is_deadline_telemetry(&kernel_step));
         assert!(is_online_evidence(&kernel_step));
     }
