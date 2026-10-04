@@ -101,6 +101,11 @@ impl<T> FifoReceiver<T> {
         n_recv
     }
 
+    /// Messages received but not yet processed (left over by `process_many`).
+    pub fn has_pending(&self) -> bool {
+        !self.pending_msg.is_empty()
+    }
+
     pub fn process_many<H>(&mut self, max_process: usize, mut handler: H)
     where
         H: FnMut(T),
@@ -1477,12 +1482,29 @@ const FIFO_RECV_BATCH: usize = profiler::EVENT_QUEUE_SZ;
 const IPC_RECV_BATCH: usize = 512;
 const IPC_SEND_BATCH: usize = 64;
 const NCCLOP_RECLAIM_BATCH: usize = 512;
-/// After `IDLE_SPIN` without a message the daemon sleeps `IDLE_SLEEP` per
-/// polling pass instead of spinning. A daemon that never sleeps holds a whole
-/// core next to the training threads (one per process). Records wait at most
-/// about one sleep; the monitor polls every 20 ms.
-const IDLE_SPIN: Duration = Duration::from_micros(20);
-const IDLE_SLEEP: Duration = Duration::from_micros(50);
+/// The daemon sleeps `idle_sleep()` after every polling pass that left no
+/// backlog (queued messages or telemetry), instead of polling back to back
+/// while records trickle in. Each pass forwards every thread's online records
+/// in turn, so the sleep bounds how late and how far out of order they reach
+/// the monitor: at 1000 us the monitor misread EP4 compute misses as
+/// propagated waits; 100 us keeps them in step. `COMMA_DAEMON_SLEEP_US`
+/// overrides the default 100 us.
+fn idle_sleep() -> Duration {
+    static SLEEP: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *SLEEP.get_or_init(|| {
+        std::env::var("COMMA_DAEMON_SLEEP_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_micros)
+            .unwrap_or(Duration::from_micros(100))
+    })
+}
+/// The reclaim scan pops the oldest tracked ops and re-inserts the ones it
+/// keeps. Ops stay tracked `NCCL_PROFILER_NCCLOP_COMPLETION_DELAY` after they
+/// end (100 ms under the monitor, a few hundred ops), so scanning on every pass
+/// re-sorted them thousands of times a second and was most of the daemon's
+/// CPU time. Reclaim only needs to keep pace with that delay.
+const RECLAIM_INTERVAL: Duration = Duration::from_millis(5);
 
 pub fn polling_loop<E>(ctx: &mut PollingContext, mut exporter: E)
 where
@@ -1504,7 +1526,7 @@ where
 
     let ncclop_timeout = ctx.profiler.config.ncclop_timeout;
     let ncclop_comp_delay = ctx.profiler.config.ncclop_completion_delay;
-    let mut last_activity = Instant::now();
+    let mut last_reclaim = Instant::now();
 
     while !ctx.stop.load(Ordering::Acquire) {
         while let Some(ctrl_msg) = ctx.profiler.ctrl_fifo.pop() {
@@ -1538,12 +1560,10 @@ where
 
         n_recv += ipc_msg.len();
 
-        let mut n_online = 0;
         for thread in threads.iter_mut() {
-            n_online +=
-                thread
-                    .ncclop_fifo
-                    .recv_many(FIFO_FETCH_INTERVAL, FIFO_RECV_BATCH, n_recv > 0);
+            thread
+                .ncclop_fifo
+                .recv_many(FIFO_FETCH_INTERVAL, FIFO_RECV_BATCH, n_recv > 0);
             thread
                 .ncclop_fifo
                 .process_many(ONLINE_FIFO_PROCESS_BATCH, |msg| {
@@ -1604,18 +1624,21 @@ where
             ctx.free_proxyop.try_publish(&ctx.profiler.free_proxyop);
         }
 
-        let mut n_processed = 0;
-        ctx.try_reclaim_ncclops_from_map(|op| {
-            if n_processed > NCCLOP_RECLAIM_BATCH {
-                return ReclaimAction::Stop;
-            }
-            n_processed += 1;
-            if should_reclaim_ncclop(op, ncclop_comp_delay, ncclop_timeout) {
-                ReclaimAction::Reclaim
-            } else {
-                ReclaimAction::Keep
-            }
-        });
+        if last_reclaim.elapsed() >= RECLAIM_INTERVAL {
+            last_reclaim = Instant::now();
+            let mut n_processed = 0;
+            ctx.try_reclaim_ncclops_from_map(|op| {
+                if n_processed > NCCLOP_RECLAIM_BATCH {
+                    return ReclaimAction::Stop;
+                }
+                n_processed += 1;
+                if should_reclaim_ncclop(op, ncclop_comp_delay, ncclop_timeout) {
+                    ReclaimAction::Reclaim
+                } else {
+                    ReclaimAction::Keep
+                }
+            });
+        }
 
         if ctx.ncclops.len() > ctx.profiler.config.max_tracked_ncclop {
             // force reclaim
@@ -1634,10 +1657,12 @@ where
         ctx.prune_online_state();
         exporter.export(ctx, None);
 
-        if n_recv + n_online > 0 || !ctx.pending_telemetry.is_empty() {
-            last_activity = Instant::now();
-        } else if last_activity.elapsed() >= IDLE_SPIN {
-            std::thread::sleep(IDLE_SLEEP);
+        let backlog = !ctx.pending_telemetry.is_empty()
+            || threads
+                .iter()
+                .any(|t| t.fifo.has_pending() || t.ncclop_fifo.has_pending());
+        if !backlog {
+            std::thread::sleep(idle_sleep());
         }
     }
 

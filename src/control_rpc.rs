@@ -93,7 +93,10 @@ pub fn spawn_control_server(profiler: &'static Profiler) {
     };
     if let Err(e) = std::thread::Builder::new()
         .name("comma-control-rpc".into())
-        .spawn(move || run_server(path, profiler))
+        .spawn(move || {
+            crate::helper_affinity::pin_current_thread();
+            run_server(path, profiler)
+        })
     {
         warn!("failed to spawn CoMMA control RPC thread: {e}");
     }

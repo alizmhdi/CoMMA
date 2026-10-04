@@ -22,6 +22,7 @@ mod event_ffi;
 mod fixed_batch;
 mod gcp_acs_proto; // copybara:strip(oss_protobuf)
 mod gpuviz;
+mod helper_affinity;
 mod histogram;
 mod live_ring;
 mod nccl_metadata;

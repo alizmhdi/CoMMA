@@ -57,6 +57,8 @@ impl Daemon for CloudDaemon {
     fn new(profiler: &'static Profiler) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            // Workers and the blocking pool (the daemon's polling loop) alike.
+            .on_thread_start(crate::helper_affinity::pin_current_thread)
             .enable_all()
             .build()
             .unwrap();
@@ -1202,6 +1204,7 @@ async fn main_loop(
     let stop_signal_copy = stop_signal.clone();
     let timer_tick = if profiler.config.use_cached_clock {
         Some(std::thread::spawn(move || {
+            crate::helper_affinity::pin_current_thread();
             while !stop_signal_copy.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_micros(5));
                 profiler.cached_clock.update_cache(Instant::now());
