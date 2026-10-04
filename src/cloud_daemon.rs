@@ -1112,24 +1112,36 @@ impl Export for Exporter {
     }
 }
 
+/// KernelCh progress rides the deadline lane with its parent's issue and
+/// completion: the posted record carries the collective's GPU start, which the
+/// monitor must see before the completion. On the online lane the biased
+/// writer let completions overtake it (35-75% of DP2 x TP2 collectives, more
+/// with a lazier proxy poll), and the monitor then took the CPU enqueue as the
+/// GPU start, hiding queueing behind a busy GPU.
 fn is_deadline_telemetry(telemetry: &Telemetry) -> bool {
-    matches!(
-        telemetry,
-        Telemetry::NcclOpIssued(_)
-            | Telemetry::P2pParentStart(_)
-            | Telemetry::P2pGroupSeal(_)
-            | Telemetry::NcclOpComplete(_)
-            | Telemetry::CommOpen(_)
-            | Telemetry::CommInit(_)
-            | Telemetry::CommClose(_)
-    )
+    match telemetry {
+        Telemetry::StepProgress(progress) => {
+            progress.source == event::StepProgressSource::KernelCh
+        }
+        _ => matches!(
+            telemetry,
+            Telemetry::NcclOpIssued(_)
+                | Telemetry::P2pParentStart(_)
+                | Telemetry::P2pGroupSeal(_)
+                | Telemetry::NcclOpComplete(_)
+                | Telemetry::CommOpen(_)
+                | Telemetry::CommInit(_)
+                | Telemetry::CommClose(_)
+        ),
+    }
 }
 
 fn is_online_evidence(telemetry: &Telemetry) -> bool {
-    matches!(
-        telemetry,
-        Telemetry::StepProgress(_) | Telemetry::KernelCopy(_) | Telemetry::ProxySend(_)
-    )
+    !is_deadline_telemetry(telemetry)
+        && matches!(
+            telemetry,
+            Telemetry::StepProgress(_) | Telemetry::KernelCopy(_) | Telemetry::ProxySend(_)
+        )
 }
 
 #[cfg(test)]
@@ -1145,6 +1157,36 @@ mod deadline_lane_tests {
         });
         assert!(is_deadline_telemetry(&seal));
         assert!(!is_online_evidence(&seal));
+    }
+
+    fn progress(source: event::StepProgressSource) -> Telemetry {
+        let now = Instant::now();
+        Telemetry::StepProgress(event::StepProgress {
+            source,
+            stage: event::StepProgressStage::Posted,
+            observed_at: now,
+            parent_start: now,
+            parent_group_id: None,
+            rank: 0,
+            comm_hash: 1,
+            seq_num: 2,
+            parent_name: "all_gather".into(),
+            is_send: true,
+            peer: u32::MAX,
+            channel_id: 0,
+            step: -1,
+            size: 0,
+        })
+    }
+
+    #[test]
+    fn kernel_ch_progress_keeps_parent_order() {
+        let kernel_ch = progress(event::StepProgressSource::KernelCh);
+        assert!(is_deadline_telemetry(&kernel_ch));
+        assert!(!is_online_evidence(&kernel_ch));
+        let kernel_step = progress(event::StepProgressSource::Kernel);
+        assert!(!is_deadline_telemetry(&kernel_step));
+        assert!(is_online_evidence(&kernel_step));
     }
 }
 
@@ -1164,7 +1206,8 @@ async fn main_loop(
     let (tx, rx) = mpsc::channel::<Telemetry>(TELEMETRY_CHANNEL_SZ);
     const ONLINE_CHANNEL_SZ: usize = 1024;
     let (online_tx, online_rx) = mpsc::channel::<Telemetry>(ONLINE_CHANNEL_SZ);
-    const DEADLINE_CHANNEL_SZ: usize = 256;
+    // Issue, KernelCh posted and complete, and completion: four records per collective.
+    const DEADLINE_CHANNEL_SZ: usize = 1024;
     let (deadline_tx, deadline_rx) = mpsc::channel::<Telemetry>(DEADLINE_CHANNEL_SZ);
     let otel_latency_hist_manager = if profiler.config.otel_enable {
         Some(Arc::new(Mutex::new(otel_utils::HistogramManager::new(
