@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::event::{Event, Group, ProxyStep};
-use crate::profiler::{KernelCh, ProxyOpLocalData};
+use crate::profiler::{KernelCh, KernelStepLocal, ProxyOpLocalData};
 use crate::slab;
 
 use static_assertions::const_assert;
@@ -34,6 +34,7 @@ pub enum Type {
     SmallNcclOp,
     ProxyStep,
     KernelCh,
+    KernelStep,
 }
 
 impl Type {
@@ -48,6 +49,7 @@ impl Type {
             Type::SmallNcclOp => 0b110,
             Type::ProxyStep => 0b111,
             Type::KernelCh => 0b1000,
+            Type::KernelStep => 0b1001,
         }
     }
 
@@ -62,6 +64,7 @@ impl Type {
             0b110 => Type::SmallNcclOp,
             0b111 => Type::ProxyStep,
             0b1000 => Type::KernelCh,
+            0b1001 => Type::KernelStep,
             _ => panic!("unknown bit pattern"),
         }
     }
@@ -85,6 +88,40 @@ fn to_ncclop_handle(handle: Handle) -> usize {
     get_handle_inner(handle) >> N_TYPE_BITS
 }
 
+/// Read the monotonic Group id from a live NCCL Group handle without taking
+/// ownership. Returns None when `handle` is not a Group.
+pub fn peek_group_id(handle: Handle) -> Option<u64> {
+    if handle.is_null() || get_handle_type(handle) != Type::Group {
+        return None;
+    }
+    let ptr = get_handle_inner(handle) as *const Group;
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: NCCL holds the Group event until Group stop. P2P/COLL start
+        // runs while that parent Group handle is still live.
+        Some(unsafe { (*ptr).id() })
+    }
+}
+
+/// Record AllToAll self-copy bytes on the live parent Group. Send-to-self and
+/// recv-from-self are the same memcpy; `Group` keeps the max, not the sum.
+/// No-op when `handle` is not a Group or `bytes` is 0.
+pub fn record_group_self_copy_size(handle: Handle, bytes: usize) {
+    if bytes == 0 || handle.is_null() || get_handle_type(handle) != Type::Group {
+        return;
+    }
+    let ptr = get_handle_inner(handle) as *const Group;
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: same as peek_group_id — Group is live until Group stop, and
+    // P2P start (including self-copy) runs before that.
+    unsafe {
+        (*ptr).record_self_copy_size(bytes);
+    }
+}
+
 pub trait AsFFI: Sized {
     fn into_ffi(self) -> Handle;
 
@@ -97,6 +134,7 @@ pub trait AsFFI: Sized {
 const_assert!(std::mem::align_of::<Group>() >= (1 << N_TYPE_BITS));
 const_assert!(std::mem::align_of::<ProxyStep>() >= (1 << N_TYPE_BITS));
 const_assert!(std::mem::align_of::<KernelCh>() >= (1 << N_TYPE_BITS));
+const_assert!(std::mem::align_of::<KernelStepLocal>() >= (1 << N_TYPE_BITS));
 const_assert!(std::mem::align_of::<ProxyOpLocalData>() >= (1 << N_TYPE_BITS));
 
 impl AsFFI for Event {
@@ -125,6 +163,10 @@ impl AsFFI for Event {
             Event::KernelCh(op) => {
                 let ptr = slab::AllocatedNode::into_raw(op);
                 handle(ptr as _, Type::KernelCh)
+            }
+            Event::KernelStep(op) => {
+                let ptr = slab::AllocatedNode::into_raw(op);
+                handle(ptr as _, Type::KernelStep)
             }
             /*
             Event::ProxyOp(id) => {
@@ -185,6 +227,11 @@ impl AsFFI for Event {
                 let handle = get_handle_inner(handle) as _;
                 let proxyop = slab::AllocatedNode::from_raw(handle);
                 Some(Event::KernelCh(proxyop))
+            }
+            Type::KernelStep => {
+                let handle = get_handle_inner(handle) as _;
+                let step = slab::AllocatedNode::from_raw(handle);
+                Some(Event::KernelStep(step))
             }
             /*
             Type::ProxyOp => {
@@ -293,6 +340,27 @@ mod tests {
         } else {
             panic!("failed to get group from ffi");
         }
+    }
+
+    #[test]
+    fn peek_group_id_matches_live_handle() {
+        let group_descr = dummy_group_descr();
+        let event = Event::new_group(&group_descr, Instant::now());
+        let Event::Group(ref group) = event else {
+            panic!("expected Group");
+        };
+        let want = group.id();
+        let handle = Event::into_ffi(event);
+        assert_eq!(peek_group_id(handle), Some(want));
+        record_group_self_copy_size(handle, 100);
+        record_group_self_copy_size(handle, 257_536); // recv; max, not sum
+        record_group_self_copy_size(handle, 257_536); // send
+                                                      // SAFETY: handle came from into_ffi in this test.
+        let restored = unsafe { Event::from_ffi(handle) };
+        let Event::Group(group) = restored.expect("group") else {
+            panic!("expected Group");
+        };
+        assert_eq!(group.self_copy_size(), 257_536);
     }
 
     #[test]

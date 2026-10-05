@@ -72,6 +72,12 @@ pub struct Config {
     pub track_step_fifo_wait: bool,
     pub aggregate_steps: bool,
     pub track_kernel_ch: bool,
+    pub track_kernel_step: bool,
+    /// Recv KernelSteps mix peer wait; default send-only (same as `track_recv_steps`).
+    pub track_recv_kernel_step: bool,
+    /// Unix socket path template for mid-flight gate RPC (`%p` = pid).
+    /// Default derived from `latency_file` dir as `control-%p.sock`.
+    pub control_sock: Option<String>,
     pub ncclop_completion_delay: Duration,
     pub comm_hash_ipc_timeout: Duration,
 
@@ -89,6 +95,11 @@ pub struct Config {
 
     // Export method & config
     pub latency_file: Option<String>,
+    /// Directory hosting the per-process live-telemetry SPSC ring file.
+    /// Producer creates `<dir>/ring-<pid>.ring`; monitor discovers it via
+    /// the same directory. See `live_ring.rs` for the layout contract.
+    pub latency_ring_dir: Option<String>,
+    pub latency_flush_interval: Duration,
     pub summary_file: Option<String>,
     pub summary_interval: Duration,
 
@@ -124,8 +135,12 @@ impl Config {
         field_from_env!(s, track_steps, false);
         field_from_env!(s, track_recv_steps, false);
         field_from_env!(s, track_step_fifo_wait, true);
-        field_from_env!(s, aggregate_steps, true);
-        field_from_env!(s, track_kernel_ch, false);
+        // Coarse default: Coll/P2P start+end only (no ProxyStep / KernelStep).
+        field_from_env!(s, aggregate_steps, false);
+        field_from_env!(s, track_kernel_ch, true);
+        field_from_env!(s, track_kernel_step, false);
+        field_from_env!(s, track_recv_kernel_step, false);
+        field_from_env!(s, control_sock);
         field_from_env!(s, ncclop_completion_delay, Duration::from_secs(2));
         field_from_env!(s, comm_hash_ipc_timeout, Duration::from_secs(1));
 
@@ -152,6 +167,9 @@ impl Config {
         field_from_env!(s, use_cached_clock, false);
 
         field_from_env!(s, latency_file);
+        field_from_env!(s, latency_ring_dir);
+        // 0 disables periodic flushing (stock behavior: flush on shutdown only).
+        field_from_env!(s, latency_flush_interval, Duration::from_secs(0));
         field_from_env!(s, summary_file);
         field_from_env!(s, summary_interval, Duration::from_secs(60));
 
