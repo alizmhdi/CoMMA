@@ -1124,10 +1124,14 @@ impl Export for Exporter {
 /// rank waiting for a peer's host stall that read as ~50 ms of local GPU
 /// backlog and a false compute root, which the monitor's MoE rules do not
 /// separate yet.
+///
+/// `COMMA_KERNEL_CH_DEADLINE_LANE=0` keeps all KernelCh progress on the online
+/// lane, as before (for A/B runs).
 fn is_deadline_telemetry(telemetry: &Telemetry) -> bool {
     match telemetry {
         Telemetry::StepProgress(progress) => {
-            progress.source == event::StepProgressSource::KernelCh
+            kernel_ch_deadline_lane()
+                && progress.source == event::StepProgressSource::KernelCh
                 && !matches!(progress.parent_name.as_str(), "send" | "recv")
         }
         _ => matches!(
@@ -1141,6 +1145,16 @@ fn is_deadline_telemetry(telemetry: &Telemetry) -> bool {
                 | Telemetry::CommClose(_)
         ),
     }
+}
+
+fn kernel_ch_deadline_lane() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("COMMA_KERNEL_CH_DEADLINE_LANE").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
 }
 
 fn is_online_evidence(telemetry: &Telemetry) -> bool {
