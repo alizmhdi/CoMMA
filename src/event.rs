@@ -1216,7 +1216,8 @@ mod tests {
         assert_eq!(rec["cat"], "P2P_START");
         assert_eq!(rec["dur"], 0);
         assert_eq!(rec["ts"], 42);
-        assert!(rec.get("parent").is_none());
+        // Grouped P2P issue records name their parent group (8b4a395).
+        assert_eq!(rec["parent"], json!(want));
         let _ = unsafe { Event::from_ffi(handle) };
     }
 }
