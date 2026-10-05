@@ -1112,27 +1112,33 @@ impl Export for Exporter {
     }
 }
 
-/// A collective's KernelCh progress rides the deadline lane with its issue and
-/// completion: the posted record carries the collective's GPU start, which the
+/// KernelCh progress rides the deadline lane with its parent's issue and
+/// completion: the posted record carries the parent's GPU start, which the
 /// monitor must see before the completion. On the online lane the biased
 /// writer let completions overtake it (35-75% of DP2 x TP2 collectives, more
 /// with a lazier proxy poll), and the monitor then took the CPU enqueue as the
 /// GPU start, hiding queueing behind a busy GPU.
 ///
-/// P2P KernelCh progress stays on the online lane. A grouped send/recv's first
-/// KernelCh can be stamped only once a stalled peer arrives; on a healthy EP4
-/// rank waiting for a peer's host stall that read as ~50 ms of local GPU
-/// backlog and a false compute root, which the monitor's MoE rules do not
-/// separate yet.
+/// Grouped send/recv progress moved last: its completions used to be stamped
+/// early (a P2P batch splits warps between works and the terminal batch did
+/// not wait for all of them), so on a healthy EP4 rank waiting out a peer's
+/// host stall the next group's on-time start read as ~10 ms of local GPU
+/// backlog and a false compute root. The KernelStep NCCL now stamps the
+/// terminal batch after a block barrier.
 ///
-/// `COMMA_KERNEL_CH_DEADLINE_LANE=0` keeps all KernelCh progress on the online
-/// lane, as before (for A/B runs).
+/// `COMMA_KERNEL_CH_DEADLINE_LANE`: `collectives` keeps P2P progress on the
+/// online lane and `0` all KernelCh progress (for A/B runs).
 fn is_deadline_telemetry(telemetry: &Telemetry) -> bool {
     match telemetry {
         Telemetry::StepProgress(progress) => {
-            kernel_ch_deadline_lane()
-                && progress.source == event::StepProgressSource::KernelCh
-                && !matches!(progress.parent_name.as_str(), "send" | "recv")
+            progress.source == event::StepProgressSource::KernelCh
+                && match kernel_ch_deadline_lane() {
+                    KernelChLane::Online => false,
+                    KernelChLane::Collectives => {
+                        !matches!(progress.parent_name.as_str(), "send" | "recv")
+                    }
+                    KernelChLane::All => true,
+                }
         }
         _ => matches!(
             telemetry,
@@ -1147,12 +1153,28 @@ fn is_deadline_telemetry(telemetry: &Telemetry) -> bool {
     }
 }
 
-fn kernel_ch_deadline_lane() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("COMMA_KERNEL_CH_DEADLINE_LANE").as_deref(),
-            Ok("0") | Ok("false")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KernelChLane {
+    Online,
+    Collectives,
+    All,
+}
+
+fn kernel_ch_lane_from(value: Option<&str>) -> KernelChLane {
+    match value {
+        Some("0") | Some("false") => KernelChLane::Online,
+        Some("collectives") => KernelChLane::Collectives,
+        _ => KernelChLane::All,
+    }
+}
+
+fn kernel_ch_deadline_lane() -> KernelChLane {
+    static LANE: std::sync::OnceLock<KernelChLane> = std::sync::OnceLock::new();
+    *LANE.get_or_init(|| {
+        kernel_ch_lane_from(
+            std::env::var("COMMA_KERNEL_CH_DEADLINE_LANE")
+                .ok()
+                .as_deref(),
         )
     })
 }
@@ -1201,13 +1223,26 @@ mod deadline_lane_tests {
     }
 
     #[test]
-    fn collective_kernel_ch_progress_keeps_parent_order() {
+    fn kernel_ch_lane_setting() {
+        assert_eq!(kernel_ch_lane_from(None), KernelChLane::All);
+        assert_eq!(kernel_ch_lane_from(Some("1")), KernelChLane::All);
+        assert_eq!(kernel_ch_lane_from(Some("all")), KernelChLane::All);
+        assert_eq!(
+            kernel_ch_lane_from(Some("collectives")),
+            KernelChLane::Collectives
+        );
+        assert_eq!(kernel_ch_lane_from(Some("0")), KernelChLane::Online);
+        assert_eq!(kernel_ch_lane_from(Some("false")), KernelChLane::Online);
+    }
+
+    #[test]
+    fn kernel_ch_progress_keeps_parent_order() {
         let kernel_ch = progress(event::StepProgressSource::KernelCh, "all_gather");
         assert!(is_deadline_telemetry(&kernel_ch));
         assert!(!is_online_evidence(&kernel_ch));
         let p2p_kernel_ch = progress(event::StepProgressSource::KernelCh, "send");
-        assert!(!is_deadline_telemetry(&p2p_kernel_ch));
-        assert!(is_online_evidence(&p2p_kernel_ch));
+        assert!(is_deadline_telemetry(&p2p_kernel_ch));
+        assert!(!is_online_evidence(&p2p_kernel_ch));
         let kernel_step = progress(event::StepProgressSource::Kernel, "all_gather");
         assert!(!is_deadline_telemetry(&kernel_step));
         assert!(is_online_evidence(&kernel_step));
